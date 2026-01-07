@@ -1,0 +1,37 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/" {
+    function beforeAll(){
+        super.beforeAll();
+    }
+    function run(){
+        // Load env-driven settings
+        var testPathS3         = getSystemSetting("S3_TEST_PATH_S3", "s3:///my-test-bucket/test-dir/");
+        var testLocalFileSmall = getSystemSetting("S3_TEST_LOCAL_FILE_SMALL", "/tmp/s3test/small.txt");
+
+        describe( 'CSDirectoryDelete BIF (env-configured)', () => {
+            it( 'deletes a temporary folder under the configured test path', () => {
+                var rand   = lcase( replace( createUUID(), '-', '', 'all' ) );
+                var tmpDir = testPathS3 & 'tmpdel-' & rand & '/';
+
+                // Create directory and upload one file into it
+                var created = CSDirectoryCreate( tmpDir );
+                expect( ( created.success ?: false ) || ( created.message ?: '' ) == 'exists' ).toBeTrue();
+
+                var smallName = listLast( testLocalFileSmall, '/' );
+                var up = CSFileCopy( source = testLocalFileSmall, destination = tmpDir & smallName );
+                expect( up.success ?: (! ( up.error ?: false )) ).toBeTrue();
+
+                // Verify presence
+                expect( CSDirectoryExists( tmpDir ) ).toBeTrue();
+                var contents = CSDirectoryList( path = tmpDir, recurse = true, listInfo = 'name', type='file' );
+                expect( arrayFindNoCase( contents, smallName ) ).toBeGTE( 1 );
+
+                // Delete and verify
+                var del = CSDirectoryDelete( tmpDir );
+                expect( del.success ?: false ).toBeTrue();
+                // Listing now should be empty or path no longer present
+                var contentsAfter = CSDirectoryList( path = tmpDir, recurse = true, listInfo = 'name', type='file' );
+                expect( arrayLen( contentsAfter ) ).toBe( 0 );
+            });
+        });
+    }
+}

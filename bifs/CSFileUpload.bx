@@ -1,0 +1,113 @@
+/**
+ * This is a BOXLANG BIF.  Please note that all BIFs are registered
+ * as singletons.
+ *
+ * Annotations you can use on a BIF:
+ * <pre>
+ * // The alias of the BIF, defaults to the name of the Class
+ * @BoxBIF - The BIF is registered as the name of the class
+ * @BoxBIF( 'myBifAlias' ) - Register with the specific name
+ * @BoxBIF( [ 'myBifAlias', 'myOtherBifAlias' ] ) - Register with all these names
+ * @BoxMember( 'string' ) : Register also as a member method on strings.
+ * @BoxMember( { 'string' : { name : '', objectArgument : '' }, 'array' : { name : '', objectArgument : '' } } ) - Register on multiple types
+ * </pre>
+ *
+ * The runtime injects the following into the `variables` scope:
+ *
+ * - moduleRecord : The ModuleRecord instance
+ *
+ */
+import bxModules.bxcloudstorage.models.CloudStorageService;
+
+@BoxBIF
+class {
+    @inject
+    property name="moduleRecord";
+
+    /**
+     * Upload a local file to S3, choosing single PUT or multipart upload based on size.
+     * Streams from disk for low memory usage.
+     *
+     * @source Absolute path to the local file to upload.
+     * @destination Cloud destination: `s3:///bucket/key` or relative key (resolved via settings in CloudStorageService).
+     * @multipartThreshold File size in bytes above which multipart upload is used (default 25MB; overridable via `UploadMultipartThreshold`).
+     * @partSize Size in bytes for each multipart part (default 16MB; minimum 5MB per S3 rules; overridable via `UploadPartSize`).
+     * @maxConcurrent Maximum concurrent part uploads for multipart mode (default from code 54; overridable via `UploadMaxConcurrent`).
+     * @fileTimeout Timeout in seconds for the overall upload in multipart mode (default 60; overridable via `FileTransferTimeout`).
+     * @return Struct: `{ success:boolean, message:string, bucketName:string, objectKey:string, etag?:string, parts?:numeric }`. On failure, `success=false` with `message`.
+     */
+    struct function invoke(
+        required string source,
+        required string destination,
+        numeric multipartThreshold = 25 * 1024 * 1024,
+        numeric partSize = 16 * 1024 * 1024,
+        numeric maxConcurrent = 54,
+        numeric fileTimeout = 60
+    ) {
+        // Validate file
+        if( !fileExists( arguments.source ) ){
+            return { success=false, message='CSFileUpload: Local file not found', bucketName='', objectKey='' };
+        }
+        var size = fileInfo( arguments.source ).size;
+        if( size == 0 ){
+            // Edge case: empty file still valid; treat as small
+        }
+
+        // Override thresholds from module settings if present
+        try {
+            if( val( moduleRecord?.settings?.UploadMultipartThreshold ) ) multipartThreshold = val( moduleRecord.settings.UploadMultipartThreshold );
+            if( val( moduleRecord?.settings?.UploadPartSize ) ) partSize = val( moduleRecord.settings.UploadPartSize );
+            if( val( moduleRecord?.settings?.UploadMaxConcurrent ) ) maxConcurrent = val( moduleRecord.settings.UploadMaxConcurrent );
+            if( val( moduleRecord?.settings?.FileTransferTimeout ) ) fileTimeout = val( moduleRecord.settings.FileTransferTimeout );
+        } catch( any ignore ){}
+
+        if( arguments.partSize < 5 * 1024 * 1024 ) arguments.partSize = 5 * 1024 * 1024;
+
+        // Use CloudStorageService to get the storage and parse destination object
+		var cloud = new CloudStorageService().getStorageForPath( arguments.destination );
+
+        // Small file: single putObject via cloud.storage
+        if( size <= multipartThreshold ){
+            try {
+                var contentType = '';
+                try { contentType = fileGetMimeType( arguments.source ); } catch( any ignore ){}
+				writeLog( log="CloudStorage", type="debug", text="CSFileUpload: Performing single PUT for small file upload: " & arguments.source & " to " & arguments.destination );
+                var putResp = cloud.storage.putObject( cloud.bucketName, cloud.objectKey, fileReadBinary( arguments.source ), contentType );
+				writeLog( log="CloudStorage", type="debug", text="CSFileUpload: Single PUT upload completed: " & arguments.source & " to " & arguments.destination );
+                return { success=true, message='uploaded', bucketName=cloud.bucketName, objectKey=cloud.objectKey, etag=putResp?.eTag ?: '' };
+            } catch( any e ) {
+				writeLog( log="CloudStorage", type="error", text="CSFileUpload: Small file upload failed: " & e.message );
+                return { success=false, message='CSFileUpload small put failed: ' & e.message, bucketName=cloud.bucketName, objectKey=cloud.objectKey };
+            }
+        }
+
+        // Large file: multipart async upload via cloud.storage
+        try {
+			writeLog( log="CloudStorage", type="debug", text="CSFileUpload: Performing multipart upload for large file: ( " & size & " bytes) " & arguments.source & " to " & arguments.destination );
+            var uploadResp = cloud.storage.multipartUploadAsync(
+                cloud.bucketName,
+                cloud.objectKey,
+                arguments.source,
+                arguments.partSize,
+                maxConcurrent,
+                fileTimeout
+            );
+            if( structKeyExists( uploadResp, "error" ) && uploadResp.error ){
+				writeLog( log="CloudStorage", type="error", text="CSFileUpload: Multipart upload failed: " & uploadResp.message );
+                return { success=false, message='CSFileUpload multipart failed: ' & uploadResp.message, bucketName=cloud.bucketName, objectKey=cloud.objectKey };
+            }
+			writeLog( log="CloudStorage", type="debug", text="CSFileUpload: Multipart upload completed: " & arguments.source & " to " & arguments.destination );
+            return {
+                success=true,
+                message='uploaded (multipart)',
+                bucketName=cloud.bucketName,
+                objectKey=cloud.objectKey,
+                etag=uploadResp.eTag ?: '',
+                parts=uploadResp.parts ?: 0
+            };
+        } catch( any e ) {
+			writeLog( log="CloudStorage", type="error", text="CSFileUpload: Multipart upload exception: " & e.message );
+            return { success=false, message='CSFileUpload multipart failed: ' & e.message, bucketName=cloud.bucketName, objectKey=cloud.objectKey };
+        }
+    }
+}

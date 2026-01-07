@@ -1,0 +1,92 @@
+/**
+ * This is a BOXLANG BIF.  Please note that all BIFs are registered
+ * as singletons.
+ *
+ * Annotations you can use on a BIF:
+ * <pre>
+ * // The alias of the BIF, defaults to the name of the Class
+ * @BoxBIF - The BIF is registered as the name of the class
+ * @BoxBIF( 'myBifAlias' ) - Register with the specific name
+ * @BoxBIF( [ 'myBifAlias', 'myOtherBifAlias' ] ) - Register with all these names
+ * @BoxMember( 'string' ) : Register also as a member method on strings.
+ * @BoxMember( { 'string' : { name : '', objectArgument : '' }, 'array' : { name : '', objectArgument : '' } } ) - Register on multiple types
+ * </pre>
+ *
+ */
+@BoxBIF
+class {
+    /**
+     * Batch download Cloud Storage objects asynchronously using CSFileDownload BIF.
+     *
+     * @sources   Array of source URIs (each full s3://bucket/key or relative; relative requires bucket config handled by CSFileDownload)
+     * @destinations Array of destination file paths matching sources 1:1
+     * @concurrency Max parallel futures (default 5)
+     * @failFast If true abort remaining futures on first error
+     * @return struct { success:boolean, results:array, errors:array, elapsed:ms }
+     */
+    struct function invoke( required array sources, required array destinations, numeric concurrency=5, boolean failFast=false ) {
+        var startedAt=getTickCount();
+        var errors=[];
+        var results=[];
+
+        // Basic validations
+        if( arrayLen( arguments.sources ) == 0 ) return { success=true, results=[], errors=[], elapsed=0 };
+        if( arrayLen( arguments.sources ) != arrayLen( arguments.destinations ) ) throw( message='CSFileDownloadBatch: sources and destinations length mismatch' );
+        if( arguments.concurrency < 1 ) arguments.concurrency=1;
+
+        // Helper to spawn a future for a single pair
+        var spawn=( src, dest ) -> futureNew( () => {
+            try { return { ok=true, data=CSFileDownload( src, dest ) }; }
+            catch( any e ) { return { ok=false, data={ filename=dest, error=true, message=e.message } }; }
+        } );
+
+        var queueIndex=1;
+        var active=[];
+
+        // Prime initial futures up to concurrency limit
+        while( queueIndex <= arrayLen( arguments.sources ) && arrayLen( active ) < arguments.concurrency ){
+            arrayAppend( active, spawn( arguments.sources[ queueIndex ], arguments.destinations[ queueIndex ] ) );
+            queueIndex++;
+        }
+
+        // Processing loop
+        while( arrayLen( active ) ){
+            // Collect any finished futures
+            var stillActive=[];
+            for( var f in active ){
+                // Attempt non-blocking get: assume Future exposes isDone()/get(); fallback to blocking get if API unknown
+                var done=false;
+                try { done=f.isDone(); } catch( any ignore ){ done=true; }
+                if( done ){
+                    var out={};
+                    try { out=f.get(); } catch( any eg ){ out={ ok=false, data={ error=true, message=eg.message } }; }
+                    if( out.ok ){
+                        arrayAppend( results, out.data );
+                    } else {
+                        arrayAppend( errors, out.data );
+                        if( arguments.failFast ){
+                            // Cancel remaining futures if API available
+                            for( var cf in active ){
+                                try { if( structKeyExists( cf, 'cancel' ) ) cf.cancel(); } catch( any ignore ){}
+                            }
+                            return { success=false, results=results, errors=errors, elapsed=( getTickCount()-startedAt ) };
+                        }
+                    }
+                    // Spawn next queued future if any remain
+                    if( queueIndex <= arrayLen( arguments.sources ) ){
+                        arrayAppend( stillActive, spawn( arguments.sources[ queueIndex ], arguments.destinations[ queueIndex ] ) );
+                        queueIndex++;
+                    }
+                } else {
+                    arrayAppend( stillActive, f );
+                }
+            }
+            active=stillActive;
+            // Avoid tight loop; short sleep if still processing
+            if( arrayLen( active ) ) sleep( 25 );
+        }
+
+        return { success=( arrayLen( errors ) == 0 ), results=results, errors=errors, elapsed=( getTickCount() - startedAt ) };
+    }
+
+}

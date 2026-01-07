@@ -1,0 +1,29 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/" {
+    function beforeAll(){
+        super.beforeAll();
+    }
+
+    function run(){
+        // Load config from environment, same as CSDirectoryExistsSpec
+        var testPathS3         = getSystemSetting("S3_TEST_PATH_S3", "s3:///my-test-bucket/test-dir/");
+
+        describe( 'CSDirectoryCreate BIF (env-configured)', () => {
+            it( 'creates a new random subdirectory under the configured path', () => {
+                var rand = lcase( replace( createUUID(), '-', '', 'all' ) );
+                var newDir = testPathS3 & 'created-' & rand & '/';
+
+                var res = CSDirectoryCreate( newDir );
+                expect( isStruct( res ) ).toBeTrue();
+                expect( res.success ?: false ).toBeTrue();
+                // Either created or already existed (should be created for random suffix)
+                expect( ( res.created ?: false ) || ( res.existed ?: false ) ).toBeTrue();
+
+                // Verify existence via CSDirectoryExists
+                expect( CSDirectoryExists( newDir ) ).toBeTrue();
+
+                // Cleanup: best-effort delete
+                try { CSDirectoryDelete( newDir ); } catch( any ignore ){}
+            });
+        });
+    }
+}

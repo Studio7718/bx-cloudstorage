@@ -1,0 +1,35 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/" {
+    function beforeAll(){
+        super.beforeAll();
+    }
+
+    function run(){
+        // Load env-driven settings similar to CSDirectoryExistsSpec
+        var testPathS3         = getSystemSetting("S3_TEST_PATH_S3", "s3:///my-test-bucket/test-dir/");
+        var testLocalFileSmall = getSystemSetting("S3_TEST_LOCAL_FILE_SMALL", "/tmp/s3test/small.txt");
+
+        describe( 'CSFileDelete BIF (env-configured)', () => {
+            it( 'deletes a temporary file in the configured test dir', () => {
+                var rand      = lcase( replace( createUUID(), '-', '', 'all' ) );
+                var baseName  = listLast( testLocalFileSmall, '/' );
+                var tmpName   = 'tmp-' & rand & '-' & baseName;
+                var s3Key     = testPathS3 & tmpName;
+
+                // Upload a small local file so we have something to delete
+                var up = CSFileCopy( source = testLocalFileSmall, destination = s3Key );
+                expect( up.success ?: (! ( up.error ?: false )) ).toBeTrue();
+
+                // Verify presence via listing
+                var names = CSDirectoryList( path = testPathS3, recurse = true, listInfo = 'name', type='file' );
+                expect( arrayFindNoCase( names, tmpName ) ).toBeGTE( 1 );
+
+                // Delete and verify removal
+                var del = CSFileDelete( s3Key );
+                expect( del.success ?: false ).toBeTrue();
+
+                var namesAfter = CSDirectoryList( path = testPathS3, recurse = true, listInfo = 'name', type='file' );
+                expect( arrayFindNoCase( namesAfter, tmpName ) ).toBe( 0 );
+            });
+        });
+    }
+}

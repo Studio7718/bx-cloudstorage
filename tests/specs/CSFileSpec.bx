@@ -1,0 +1,59 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/" {
+    function beforeAll(){
+        super.beforeAll();
+        // Env-driven values
+        variables.testPathS3         = getSystemSetting("S3_TEST_PATH_S3", "s3:///my-test-bucket/test-dir/");
+        variables.testLocalPath      = getSystemSetting("S3_TEST_LOCAL_PATH", "/tmp/s3test/");
+        variables.testLocalFileSmall = getSystemSetting("S3_TEST_LOCAL_FILE_SMALL", "/tmp/s3test/small.txt");
+        variables.testLocalFileLarge = getSystemSetting("S3_TEST_LOCAL_FILE_LARGE", "/tmp/s3test/large.bin");
+
+        // Ensure local dir/files present
+        if( !directoryExists( variables.testLocalPath ) ) directoryCreate( variables.testLocalPath, true );
+        if( !fileExists( variables.testLocalFileSmall ) ) fileWrite( variables.testLocalFileSmall, repeatString( "a", 1024 ) );
+        if( !fileExists( variables.testLocalFileLarge ) ){
+            var chunk = repeatString( "b", 1024 );
+            var out = createObject( 'java', 'java.io.FileOutputStream' ).init( variables.testLocalFileLarge );
+            try { for( var i=1; i<=256; i++ ) out.write( toBinary( toBase64( chunk ) ) ); } finally { out.close(); }
+        }
+    }
+
+    function run(){
+        var rand = lcase( replace( createUUID(), '-', '', 'all' ) );
+        var s3Folder = variables.testPathS3 & 'filespec-' & rand & '/';
+
+        var smallName = listLast( variables.testLocalFileSmall, '/' );
+        var s3Small   = s3Folder & smallName;
+        var s3SmallCopy = s3Folder & 'copy-' & smallName;
+
+        // Local download target
+        var destLocal = variables.testLocalPath & 'dl-' & rand & '-' & smallName;
+        if( fileExists( destLocal ) ) fileDelete( destLocal );
+
+        describe( 'CSFile progressive flows (env-configured): local→S3, S3→local, S3→S3', () => {
+            it( 'uploads local to S3 (CSFileUpload)', () => {
+                var res = CSFileUpload( source = variables.testLocalFileSmall, destination = s3Small );
+                expect( res.success ).toBeTrue();
+                var names = CSDirectoryList( path = s3Folder, recurse = true, listInfo = 'name', type = 'file' );
+                expect( arrayFindNoCase( names, smallName ) ).toBeGTE( 1 );
+            });
+
+            it( 'downloads S3 to local (CSFileDownload)', () => {
+                var res = CSFileDownload( source = s3Small, destination = destLocal );
+                expect( (res.error ?: false) ).toBeFalse();
+                expect( fileExists( destLocal ) ).toBeTrue();
+                expect( fileSize( destLocal ) ).toBeGT( 0 );
+            });
+
+            it( 'server-side S3 to S3 copy (CSFileCopy)', () => {
+                var res = CSFileCopy( source = s3Small, destination = s3SmallCopy );
+                expect( res.success ).toBeTrue();
+                var names = CSDirectoryList( path = s3Folder, recurse = true, listInfo = 'name', type = 'file' );
+                expect( arrayFindNoCase( names, 'copy-' & smallName ) ).toBeGTE( 1 );
+            });
+        });
+
+        // Cleanup created resources
+        try { if( fileExists( destLocal ) ) fileDelete( destLocal ); } catch( any ignore ){}
+        try { CSDirectoryDelete( s3Folder ); } catch( any ignore ){}
+    }
+}

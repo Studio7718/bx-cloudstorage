@@ -1,0 +1,127 @@
+/**
+ * This is a BOXLANG BIF.  Please note that all BIFs are registered
+ * as singletons.
+ *
+ * Annotations you can use on a BIF:
+ * <pre>
+ * The alias of the BIF, defaults to the name of the Class
+ * @BoxBIF - The BIF is registered as the name of the class
+ * @BoxBIF( 'myBifAlias' ) - Register with the specific name
+ * @BoxBIF( [ 'myBifAlias', 'myOtherBifAlias' ] ) - Register with all these names
+ * @BoxMember( 'string' ) : Register also as a member method on strings.
+ * @BoxMember( { 'string' : { name : '', objectArgument : '' }, 'array' : { name : '', objectArgument : '' } } ) - Register on multiple types
+ * </pre>
+ *
+ */
+import bxModules.bxcloudstorage.models.CloudStorageService;
+
+@BoxBIF
+class {
+
+    /**
+     * Copy a single file between local filesystem and S3, delegating to specific BIFs.
+     * - s3:/// -> local: uses `CSFileDownload`
+     * - local -> s3:///: uses `CSFileUpload`
+     * - s3:/// -> s3:///: tries server-side copy, falls back to download+upload if needed
+     * - otherwise: error
+     *
+     * @source Source path: local file path or cloud path `s3:///bucket/key` (relative keys resolved by CloudStorageService).
+     * @destination Destination path: local file path or cloud path `s3:///bucket/key`.
+     * @return Struct: `{ success:boolean, operation:string, data?:struct, message:string, source?:struct, destination?:struct }`.
+     *         For server-side copy, `data` contains provider response or fallback `{ download, upload }`.
+     */
+    struct function invoke( required string source, required string destination ) {
+        var cs = new CloudStorageService();
+        var s3BucketSetting = getSystemSetting( 'S3_BUCKET', '' );
+        var src = cs.resolvePath( arguments.source, s3BucketSetting );
+        var dest = cs.resolvePath( arguments.destination, s3BucketSetting );
+        var isSourceS3 = src.isCloud;
+        var isDestS3   = dest.isCloud;
+
+        // Server-side copy when both are S3
+        if( isSourceS3 && isDestS3 ){
+            // Use CloudStorageService-resolved descriptors
+            var srcInfo = { bucketName: src.bucketName, objectKey: src.objectKey };
+            var destInfo = { bucketName: dest.bucketName, objectKey: dest.objectKey };
+
+            // Get cloud storage strategy via CloudStorageService
+            var storage = src.storage ?: cs.getCloudStorage( vendor = "aws-s3" );
+            // Attempt simple copyObject
+            try {
+                var copyResp = storage.copyObject(
+                    srcInfo.bucketName,
+                    srcInfo.objectKey,
+                    destInfo.bucketName,
+                    destInfo.objectKey
+                );
+                var ok = structKeyExists( copyResp, "success" ) ? copyResp.success : true;
+                return {
+                    success   = ok,
+                    operation = 'server-copy',
+                    data      = copyResp,
+                    message   = ok ? 'server copy ok' : 'server copy failed',
+                    source    = srcInfo,
+                    destination = destInfo
+                };
+            } catch( any e ) {
+                // Fallback: download then upload if direct copy not available
+                try {
+                    var tmpFile = getTempDirectory() & createUUID();
+                    var down = CSFileDownload( source=arguments.source, destination=tmpFile );
+                    if( down.error ) throw( message='fallback download failed: ' & ( down.message ?: '' ) );
+                    var up = CSFileUpload( source=tmpFile, destination=arguments.destination );
+                    // Clean temp
+                    try { if( fileExists( tmpFile ) ) fileDelete( tmpFile ); } catch( any ignore ){}
+                    return {
+                        success = !up.error,
+                        operation='server-copy-fallback',
+                        data = { download=down, upload=up },
+                        message = up.message ?: ( up.error ? 'fallback upload failed' : 'fallback copy ok' ),
+                        source = srcInfo,
+                        destination = destInfo
+                    };
+                } catch( any fe ) {
+                    return { success=false, operation='server-copy', message='CSFileCopy: server copy failed: ' & fe.message };
+                }
+            }
+        }
+        // Guard: neither S3
+        if( !isSourceS3 && !isDestS3 ){
+            return { success=false, operation='none', message='CSFileCopy: neither source nor destination is an S3 path.' };
+        }
+
+        // Upload (local -> S3)
+        if( isDestS3 ){
+            if( !fileExists( arguments.source ) ){
+                return { success=false, operation='upload', message='CSFileCopy: local source file does not exist.' };
+            }
+            try {
+                var up = CSFileUpload( source=arguments.source, destination=arguments.destination );
+                if( !structKeyExists( up, "error" ) ) up.error = false;
+                var wasSuccess = structKeyExists( up, "success" ) ? up.success : true;
+                return { success = wasSuccess && !up.error, operation='upload', data=up, message = up.message ?: ( up.error ? 'upload failed' : 'upload ok' ) };
+            } catch( any e ) {
+                return { success=false, operation='upload', message='CSFileCopy upload exception: ' & e.message };
+            }
+        }
+
+        // Download (S3 -> local)
+        if( isSourceS3 ){
+            // Ensure destination directory exists
+            var destDir = getDirectoryFromPath( arguments.destination );
+            if( len( destDir ) && !directoryExists( destDir ) ) directoryCreate( destDir, true );
+            try {
+                var down = CSFileDownload( source=arguments.source, destination=arguments.destination );
+                if( !structKeyExists( down, "error" ) ) down.error = false;
+                var wasSuccess = structKeyExists( down, "success" ) ? down.success : true;
+                return { success = wasSuccess && !down.error, operation='download', data=down, message = down.message ?: ( down.error ? 'download failed' : 'download ok' ) };
+            } catch( any e ) {
+                return { success=false, operation='download', message='CSFileCopy download exception: ' & e.message };
+            }
+        }
+
+        // Fallback (should not hit)
+        return { success=false, operation='none', message='CSFileCopy: unknown state.' };
+    }
+
+}

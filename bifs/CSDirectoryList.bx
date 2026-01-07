@@ -1,0 +1,160 @@
+/**
+ * This is a BOXLANG BIF.  Please note that all BIFs are registered
+ * as singletons.
+ *
+ * Annotations you can use on a BIF:
+ * <pre>
+ * // The alias of the BIF, defaults to the name of the Class
+ * @BoxBIF - The BIF is registered as the name of the class
+ * @BoxBIF( 'myBifAlias' ) - Register with the specific name
+ * @BoxBIF( [ 'myBifAlias', 'myOtherBifAlias' ] ) - Register with all these names
+ * @BoxMember( 'string' ) : Register also as a member method on strings.
+ * @BoxMember( { 'string' : { name : '', objectArgument : '' }, 'array' : { name : '', objectArgument : '' } } ) - Register on multiple types
+ * </pre>
+ *
+ */
+import bxModules.bxcloudstorage.models.CloudStorageService;
+
+@BoxBIF
+class {
+	/**
+	 * Lists the objects for a directory from a cloud storage vendor
+	 *
+	 * @path Cloud path like `s3:///bucket/prefix/` (trailing `/` recommended) or a relative key resolved to the default bucket.
+	 * @recurse When true, recurses all subdirectories. When false, uses `CommonPrefixes` and returns immediate children only.
+	 * @listInfo What to return: `path` | `name` | `query` (default `path`). `query` returns columns: `name,path,type,size,dateLastModified`.
+	 * @filter Optional name filter. Supports simple globs (`*` and `?`) or `regex:...` to provide a raw case‑insensitive regex.
+	 * @sort Sort key: `name` | `path` | `size` | `dateLastModified` | `type` (case‑insensitive; default `name`).
+	 * @type Entry type to return: `all` | `file` | `dir` (default `all`).
+	 * @return If `listInfo='query'`, a query of items; otherwise an array of strings (paths or names). On query creation failure, falls back to an array of structs.
+	 */
+	any function invoke( required string path, boolean recurse=false, string listInfo="path", any filter=null, string sort="name", string type="all" ) {
+		// Use CloudStorageService to get the storage and parse object
+		var cloud = new CloudStorageService().getStorageForPath( arguments.path );
+
+		var items = [];
+		var continuation = "";
+		var delimiter = arguments.recurse ? "" : "/";
+
+		// Simple glob to regex converter
+		var toRegex = ( pattern ) -> {
+			var p = trim( pattern ?: '' );
+			if( !len( p ) ) return '';
+			if( left( p,6 ) == 'regex:' ) return mid( p,7, len( p ) );
+			p = replace( p, '.', '\\.', 'all' );
+			p = replace( p, '*', '.*', 'all' );
+			p = replace( p, '?', '.', 'all' );
+			return '^' & p & '$';
+		};
+		var filterRegex = toRegex( arguments.filter );
+
+		try {
+			while( true ){
+				var resp = cloud.storage.listObjects( cloud.bucketName, cloud.objectKey, delimiter, continuation );
+
+				for(var c in resp.Contents ?: [] ){
+					var key = c.Key ?: c.key;
+					if( right( key,1 ) == '/' ) continue; // skip folder markers
+					var name = listLast( key, '/' );
+					var pathStr = cloud.prefix & cloud.bucketName & '/' & key;
+					var entry = { name = name, path = pathStr, type = 'file', size = c.Size ?: c.size, dateLastModified = c.LastModified ?: c.lastModified };
+					arrayAppend( items, entry );
+				}
+
+				// Common prefixes for non-recurse to include directories
+				if( !arguments.recurse ){
+					var prefixes = resp.CommonPrefixes ?: [];
+					for(var p in prefixes ){
+						var prefix = p.Prefix ?: p.prefix ?: '';
+						if( len( prefix ) ){
+							var name = listLast( rtrim( prefix, '/' ), '/' );
+							var pathStr = cloud.prefix & cloud.bucketName & '/' & prefix;
+							arrayAppend( items, { name=name, path=pathStr, type='dir', size=0, dateLastModified='' } );
+						}
+					}
+				}
+
+				if ( resp.IsTruncated ) {
+					continuation = resp.NextContinuationToken ?: "";
+				} else {
+					break;
+				}
+			}
+
+			// For recurse=true, derive directories from keys
+			if( arguments.recurse && ( arguments.type == 'all' || arguments.type == 'dir' ) ){
+				var dirSet = {};
+				for(var it in items ){
+					if( it.type == 'file' ){
+						var key = replace( it.path, cloud.prefix & cloud.bucketName & '/', '', 'one' );
+						var parts = listToArray( key, '/' );
+						var cur = '';
+						for(var i=1; i<arrayLen(parts); i++ ){
+							cur = cur & parts[i] & '/';
+							var dirPath = cloud.prefix & cloud.bucketName & '/' & cur;
+							dirSet[ dirPath ] = true;
+						}
+					}
+				}
+				for(var dp in structKeyArray( dirSet ) ){
+					var name = listLast( rtrim( dp, '/' ), '/' );
+					arrayAppend( items, { name=name, path=dp, type='dir', size=0, dateLastModified='' } );
+				}
+			}
+
+			// Type filter
+			if( arguments.type != 'all' ){
+				var typeFilter = lcase( arguments.type );
+				items = items.filter( (e ) => lcase( e.type ) == typeFilter );
+			}
+
+			// Name filter (glob or regex)
+			if( len( filterRegex ) ){
+				items = items.filter( (e) => reFindNoCase( filterRegex, e.name ) );
+			}
+
+			// Sorting
+			var sortKey = lcase( arguments.sort );
+			items.sort( function(a,b){
+				var av = '';
+				var bv = '';
+				switch( sortKey ){
+					case 'name': av=a.name; bv=b.name; break;
+					case 'path': av=a.path; bv=b.path; break;
+					case 'size': av=a.size ?: 0; bv=b.size ?: 0; break;
+					case 'datelastmodified': av=a.dateLastModified ?: ''; bv=b.dateLastModified ?: ''; break;
+					case 'type': av=a.type; bv=b.type; break;
+					default: av=a.name; bv=b.name; break;
+				}
+				return compare( av, bv );
+			} );
+
+			// Return format based on listInfo
+			var info = lcase( arguments.listInfo );
+			if( info == 'path' ){
+				return items.map( (e) -> e.path );
+			} else if( info == 'name' ){
+				return items.map( (e) -> e.name );
+			} else if( info == 'query' ){
+				try {
+					var q = queryNew( 'name,path,type,size,dateLastModified', 'varchar,varchar,varchar,numeric,varchar' );
+					for(var e in items ){
+						queryAddRow( q );
+						querySetCell( q, 'name', e.name );
+						querySetCell( q, 'path', e.path );
+						querySetCell( q, 'type', e.type );
+						querySetCell( q, 'size', e.size ?: 0 );
+						querySetCell( q, 'dateLastModified', e.dateLastModified ?: '' );
+					}
+					return q;
+				} catch( any e ){
+					return items; // fallback
+				}
+			}
+			return items.map( (e) -> e.path );
+		} catch( any e ){
+			throw( message = 's3DirectoryList failed: ' & e.message );
+		}
+	}
+
+}

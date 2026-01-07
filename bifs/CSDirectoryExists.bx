@@ -1,0 +1,60 @@
+/**
+ * This is a BOXLANG BIF.  Please note that all BIFs are registered
+ * as singletons.
+ *
+ * Annotations you can use on a BIF:
+ * <pre>
+ * // The alias of the BIF, defaults to the name of the Class
+ * @BoxBIF - The BIF is registered as the name of the class
+ * @BoxBIF( 'myBifAlias' ) - Register with the specific name
+ * @BoxBIF( [ 'myBifAlias', 'myOtherBifAlias' ] ) - Register with all these names
+ * @BoxMember( 'string' ) : Register also as a member method on strings.
+ * @BoxMember( { 'string' : { name : '', objectArgument : '' }, 'array' : { name : '', objectArgument : '' } } ) - Register on multiple types
+ * </pre>
+ *
+ * The runtime injects the following into the `variables` scope:
+ *
+ */
+import bxModules.bxcloudstorage.models.CloudStorageService;
+
+@BoxBIF
+class {
+
+    /**
+     * Return true if the logical "directory" exists in the cloud provider.
+     * A directory exists if:
+     *   - A zero-byte placeholder object with trailing slash exists, OR
+     *   - Any object with the given prefix (normalized with trailing slash) exists.
+     *
+     * @path Directory path (full `s3:///bucket/keyPrefix` or relative key prefix).
+     * @return Boolean. True if the logical directory exists, false otherwise.
+     */
+    boolean function invoke( required string path ) {
+        try {
+            // Use CloudStorageService to get the storage and parse object
+            var cloud = new CloudStorageService().getStorageForPath( path=arguments.path );
+
+            // Handle bucket root case - if objectKey is empty, we're checking bucket root
+            if( !len( cloud.objectKey ) || cloud.objectKey == "/" ){
+                // For bucket root, just try to list one object to see if bucket exists and has content
+                try {
+                    var resp = cloud.storage.listObjects( cloud.bucketName, "", "", "" );
+                    // If we can list objects, the bucket/directory exists
+                    return true;
+                } catch( any e ){
+                    // If listing fails, bucket might not exist or be accessible
+                    return false;
+                }
+            }
+            // Normalize prefix: ensure trailing slash when checking a logical directory
+            var keyPrefix = cloud.objectKey;
+            if( len( keyPrefix ) && right( keyPrefix, 1 ) != "/" ) keyPrefix &= "/";
+            // Use strategy pathExists which performs placeholder HEAD + prefix listing checks
+            return cloud.storage.pathExists( cloud.bucketName, keyPrefix );
+
+        } catch( any e ){
+            throw( message='CSDirectoryExists failed: ' & e.message );
+        }
+    }
+
+}

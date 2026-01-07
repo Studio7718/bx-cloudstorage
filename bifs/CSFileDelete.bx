@@ -1,0 +1,39 @@
+/**
+ * This is a BOXLANG BIF.  Please note that all BIFs are registered
+ * as singletons.
+ *
+ * Annotations you can use on a BIF:
+ * <pre>
+ * // The alias of the BIF, defaults to the name of the Class
+ * @BoxBIF - The BIF is registered as the name of the class
+ * @BoxBIF( 'myBifAlias' ) - Register with the specific name
+ * @BoxBIF( [ 'myBifAlias', 'myOtherBifAlias' ] ) - Register with all these names
+ * @BoxMember( 'string' ) : Register also as a member method on strings.
+ * @BoxMember( { 'string' : { name : '', objectArgument : '' }, 'array' : { name : '', objectArgument : '' } } ) - Register on multiple types
+ * </pre>
+ *
+ */
+import bxModules.bxcloudstorage.models.CloudStorageService;
+
+@BoxBIF
+class {
+
+	/**
+	 * Delete a single object from Cloud Storage.
+	 *
+	 * @file Cloud path to delete, e.g. `s3:///bucket/key` (relative keys resolved by CloudStorageService).
+	 * @return Struct from provider when available (e.g., `{ success:true }`), or `{ success:false, message:string }` on error.
+	 */
+	struct function invoke( required string file ) {
+	   try {
+			// Use CloudStorageService to get the storage and parse object
+			var cloud = new CloudStorageService().getStorageForPath( arguments.file );
+
+			return cloud.storage.deleteObject( cloud.bucketName, cloud.objectKey );
+
+		} catch ( any e ) {
+			return { success = false, message = 'CSFileDelete failed: ' & e.message };
+		}
+	}
+
+}

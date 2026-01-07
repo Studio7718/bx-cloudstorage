@@ -1,0 +1,58 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/" {
+
+    function beforeAll(){
+        super.beforeAll();
+        // Env-driven values similar to CSDirectoryExistsSpec
+        variables.testPathS3         = getSystemSetting("S3_TEST_PATH_S3", "s3:///my-test-bucket/test-dir/");
+        variables.testLocalFileSmall = getSystemSetting("S3_TEST_LOCAL_FILE_SMALL", "/tmp/s3test/small.txt");
+
+        // Ensure the small local file exists for optional upload
+        if( !fileExists( variables.testLocalFileSmall ) ){
+            directoryCreate( getDirectoryFromPath( variables.testLocalFileSmall ), true );
+            fileWrite( variables.testLocalFileSmall, repeatString( "x", 1024 ) );
+        }
+    }
+
+    function run(){
+        var rand = lcase( replace( createUUID(), '-', '', 'all' ) );
+        var getKey = variables.testPathS3 & 'presign-get-' & rand & '.txt';
+        var putKey = variables.testPathS3 & 'presign-put-' & rand & '.txt';
+
+        describe( 'CSFilePresign BIF (env-configured)', () => {
+            it( 'returns URL string when only file is provided (GET default)', () => {
+                // Upload a file so GET URL is valid if used
+                var up = CSFileCopy( source = variables.testLocalFileSmall, destination = getKey );
+                expect( up.success ?: (! ( up.error ?: false )) ).toBeTrue();
+
+                var urlOnly = CSFilePresign( file = getKey );
+                expect( isSimpleValue( urlOnly ) ).toBeTrue();
+                expect( len( urlOnly ) ).toBeGT( 10 );
+                expect( findNoCase( listLast( getKey, '/' ), urlOnly ) ).toBeGTE( 1 );
+            });
+
+            it( 'returns struct for GET with options', () => {
+                var res = CSFilePresign( file = getKey, method = 'GET', expiresSeconds = 300, responseHeaders = {} );
+                expect( isStruct( res ) ).toBeTrue();
+                expect( ( res.method ?: '' ) ).toBe( 'GET' );
+                expect( len( res.url ?: '' ) ).toBeGT( 10 );
+            });
+
+            it( 'returns struct with headers for PUT', () => {
+                var res = CSFilePresign(
+                    file           = putKey,
+                    method         = 'PUT',
+                    expiresSeconds = 300,
+                    contentType    = 'text/plain',
+                    metadata       = { test = 'true' }
+                );
+                expect( isStruct( res ) ).toBeTrue();
+                expect( ( res.method ?: '' ) ).toBe( 'PUT' );
+                expect( len( res.url ?: '' ) ).toBeGT( 10 );
+                expect( isStruct( res.headers ?: {} ) ).toBeTrue();
+            });
+        });
+
+        // Cleanup uploaded GET object
+        try { var del = CSFileDelete( getKey ); } catch( any ignore ){}
+    }
+}

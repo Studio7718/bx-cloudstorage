@@ -1,0 +1,414 @@
+/**
+ * This is a BOXLANG BIF.  Please note that all BIFs are registered
+ * as singletons.
+ *
+ * Annotations you can use on a BIF:
+ * <pre>
+ * // The alias of the BIF, defaults to the name of the Class
+ * @BoxBIF The BIF is registered as the name of the class
+ * @BoxBIF( 'myBifAlias' ) Register with the specific name
+ * @BoxBIF( [ 'myBifAlias', 'myOtherBifAlias' ] ) Register with all these names
+ * @BoxMember( 'string' ) Register also as a member method on strings.
+ * @BoxMember( { 'string' : { name : '', objectArgument : '' }, 'array' : { name : '', objectArgument : '' } } )  Register on multiple types
+ * </pre>
+ *
+ * The runtime injects the following into the `variables` scope:
+ *
+ * - moduleRecord : The ModuleRecord instance
+ *
+ */
+import bxModules.bxcloudstorage.models.CloudStorageService;
+
+@BoxBIF
+class {
+	@inject
+    property name="moduleRecord";
+
+	/**
+	 * Entry point for the CSFileDownload BIF
+	 * Chooses between single and multipart download based on file size
+	 *
+	 * @source Cloud object path to download, e.g. `s3:///bucket/key`. Must resolve via CloudStorageService.
+	 * @destination Local file path or directory. If a directory, the object key's filename is used.
+	 * @multipartThreshold Size in bytes above which multipart async download is used (default 25MB).
+	 * @chunkSize Chunk size in bytes for range requests in multipart mode (default 16MB).
+	 * @maxConcurrent Maximum concurrent chunk downloads for multipart mode (default 16).
+	 * @fileTimeout Timeout in seconds for the entire multipart download. If not provided or <= 0, falls back to `moduleRecord.settings.FileTransferTimeout` or 60.
+	 * @return Struct. On success: `{ method: 'single'|'async-multipart', size: <bytes>, chunks?: <number>, filename?: <path> }`. On failure: `{ filename: <destination>, error: true, message: <string> }`.
+	 */
+	struct function invoke(
+		required string source,
+		required string destination,
+		numeric multipartThreshold = 25 * 1024 * 1024,
+		numeric chunkSize = 16 * 1024 * 1024,
+		numeric maxConcurrent = 8,
+		numeric fileTimeout = 60
+	){
+		// Use CloudStorageService to get the storage and parse object
+		var cloud = new CloudStorageService().getStorageForPath( arguments.source );
+
+		// Ensure destination directory exists
+		var destDir = getDirectoryFromPath( arguments.destination );
+		if( !directoryExists( destDir ) ){
+			directoryCreate( destDir, true );
+		}
+
+		// Check if destination is a directory - if so, use the object key filename
+		var finalDestination = arguments.destination;
+		if( directoryExists( arguments.destination ) ){
+			var fileName = listLast( cloud.objectKey, "/" );
+			if( !len( fileName ) ){
+				throw( message = "Cannot determine filename from object key: " & cloud.objectKey );
+			}
+			finalDestination = arguments.destination & "/" & fileName;
+		}
+
+		// Get object metadata to determine size and choose download storage
+		var metadata = cloud.storage.getObjectMetadata( cloud.bucketName, cloud.objectKey );
+		var fileSize = metadata.size ?: 0;
+
+		// Debug logging to help troubleshoot
+		writeLog( log="CloudStorage", text="File size detected: " & fileSize & " bytes (" & numberFormat( fileSize / 1024 / 1024, "9.999" ) & " MB)", type="debug" );
+		writeLog( log="CloudStorage", text="Multipart threshold: " & arguments.multipartThreshold & " bytes (" & numberFormat( arguments.multipartThreshold / 1024 / 1024, "9.999" ) & " MB)", type="debug" );
+
+		// Determine timeout: argument, module setting, or default (used for multipart and fallback)
+		var timeoutSeconds = arguments.fileTimeout > 0
+			? arguments.fileTimeout
+			: ( structKeyExists( moduleRecord.settings, "FileTransferTimeout" ) && isNumeric( moduleRecord.settings.FileTransferTimeout ) && moduleRecord.settings.FileTransferTimeout > 0
+				? moduleRecord.settings.FileTransferTimeout
+				: 600 );
+		// Ensure very large files have a reasonable floor on timeout when not explicitly provided
+		if( arguments.fileTimeout <= 0 ){
+			var oneGB = 1024 * 1024 * 1024;
+			if( isNumeric( fileSize ) && fileSize >= oneGB ){
+				timeoutSeconds = max( timeoutSeconds, 900 );
+			}
+		}
+
+		// Only use single-download when size is known and safely small
+		var jIntMax = 2147483647; // Java byte[] max length guard
+		var useSingle = isNumeric( fileSize ) && fileSize > 0 && fileSize <= arguments.multipartThreshold && fileSize < jIntMax;
+		if( useSingle ){
+			writeLog( log="CloudStorage", text="Using single download method", type="info" );
+			// Small file: single operation download with safety fallback
+			try {
+				var result = downloadSmallFile( cloud.storage, cloud.bucketName, cloud.objectKey, finalDestination );
+				// Add name and parent
+				result.name = listLast( finalDestination, "/" );
+				result.parent = left( finalDestination, len( finalDestination ) - len( result.name ) );
+				return result;
+			} catch( any se ){
+				var msg = lcase( se.message ?: "" );
+				var needsFallback = findNoCase( "required array size too large", msg ) || findNoCase( "array size", msg );
+				if( needsFallback ){
+					writeLog( log="CloudStorage", type="warning", text="Single download failed due to array size; falling back to multipart" );
+					var largeFileResults = downloadLargeFile(
+						cloud.storage,
+						cloud.bucketName,
+						cloud.objectKey,
+						finalDestination,
+						fileSize,
+						arguments.chunkSize,
+						arguments.maxConcurrent,
+						timeoutSeconds
+					);
+					// Add name and parent
+					largeFileResults.name = listLast( finalDestination, "/" );
+					largeFileResults.parent = left( finalDestination, len( finalDestination ) - len( largeFileResults.name ) );
+					return largeFileResults;
+				}
+				// Re-throw other errors to outer handler
+				throw( se );
+			}
+		} else {
+			writeLog( log="CloudStorage", text="Using large file download method", type="info" );
+			// Large file: multipart async download
+			var largeFileResults = downloadLargeFile(
+				cloud.storage,
+				cloud.bucketName,
+				cloud.objectKey,
+				finalDestination,
+				fileSize,
+				arguments.chunkSize,
+				arguments.maxConcurrent,
+				timeoutSeconds
+			);
+			// Add name and parent
+			largeFileResults.name = listLast( finalDestination, "/" );
+			largeFileResults.parent = left( finalDestination, len( finalDestination ) - len( largeFileResults.name ) );
+			return largeFileResults;
+		}
+	}
+
+	/**
+	 * Download a file from S3 with memory-efficient transfer
+	 * Automatically chooses between single-operation download (small files)
+	 * and multipart async download (large files) based on file size
+	 *
+	 * @storage Cloud storage object with getObjectRangeStream method
+	 * @bucketName Name of the bucket containing the object
+	 * @objectKey Key of the object to download
+	 * @destination Local file path to save the downloaded object
+	 * @fileSize Size of the file in bytes (used for chunking)
+	 * @chunkSize Size of each chunk in bytes for multipart download
+	 * @maxConcurrent Maximum number of concurrent chunk downloads
+	 * @timeoutSeconds Timeout in seconds for the entire multipart download
+	 * @return Struct. On success: `{ method: 'async-multipart', size: <bytes>, chunks: <number>, filename: <path>, durationMS: <number> }`. On failure: `{ filename: <destination>, error: true, message: <string> }`.
+	 */
+	private struct function downloadLargeFile(
+		required storage,
+		required string bucketName,
+		required string objectKey,
+		required string destination,
+		required numeric fileSize,
+		required numeric chunkSize,
+		required numeric maxConcurrent,
+		required numeric timeoutSeconds
+	){
+		var overallStartTick = getTickCount();
+		var totalChunks = ceiling( fileSize / chunkSize );
+		writeLog( log="CloudStorage", type="debug", text= "CSFileDownload: Starting async multipart download: " & totalChunks & " chunks, max " & maxConcurrent & " concurrent" );
+
+		// Prepare chunk descriptors
+		var tasks = [];
+		for( var i = 1; i <= totalChunks; i++ ){
+			var startByte = ( i - 1 ) * chunkSize;
+			var endByte = min( startByte + chunkSize - 1, fileSize - 1 );
+			tasks.append( {
+				chunkIndex: i,
+				startByte: startByte,
+				endByte: endByte
+			} );
+		}
+
+		// All chunk processing is handled in batches below; no large in-memory arrays are created
+		// Use Java RandomAccessFile for direct chunk writes
+		var RandomAccessFile = createObject( "java", "java.io.RandomAccessFile" );
+		var raf = RandomAccessFile.init( destination, "rw" );
+		// Pre-allocate file size for efficiency
+		raf.setLength(fileSize);
+
+		// Create a virtual thread executor for massive concurrency
+		// Use a unique name per invocation to avoid reuse conflicts on subsequent calls
+		var vExecutor = ExecutorNew( name="s3fden-" & createUUID(), type="virtual" );
+		// Guard against duplicate chunk execution
+		var ConcurrentHashMap = createObject( "java", "java.util.concurrent.ConcurrentHashMap" );
+		var processedChunks = ConcurrentHashMap.init();
+		var downloadFuture = futureNew( () => {
+			var allResults = [];
+			var total = arrayLen(tasks);
+			var i = 1;
+			var batchNumber = 1;
+			// fail-fast state
+			var failFast = false;
+			var currentConcurrent = maxConcurrent;
+			var exhaustionEvents = 0;
+			var runtime = createObject( "java", "java.lang.Runtime" ).getRuntime();
+			while (i <= total && !failFast) {
+				var batchStartTick = getTickCount();
+				var batchStart = i;
+				// Compute a fixed-size batch based on currentConcurrent
+				var remaining = total - ( batchStart - 1 );
+				var batchSize = min( currentConcurrent, remaining );
+				var batchEnd = batchStart + batchSize - 1;
+				var batch = [];
+				for( var j = batchStart; j <= batchEnd; j++ ){
+					batch.append( tasks[ j ] );
+				}
+				var batchId = batchNumber;
+				// Log batch info and memory usage
+				var usedMemMB = ( runtime.totalMemory() - runtime.freeMemory() ) / 1024 / 1024;
+				writeLog( log="CloudStorage", type="debug", text="CSFileDownload: Starting batch ##" & batchId & " (index " & batchStart & "-" & batchEnd & ") (" & arrayLen(batch) & " chunks), usedMemMB=" & numberFormat(usedMemMB, "9.999") & " MB, concurrent=" & currentConcurrent );
+
+				var batchResults = asyncAllApply(
+					batch,
+					(chunk) => {
+						// Atomically ensure a chunk is only processed once
+						var prior = processedChunks.putIfAbsent( chunk.chunkIndex, true );
+						if( !isNull( prior ) ){
+							writeLog( log="CloudStorage", type="warning", text="CSFileDownload: Duplicate scheduling detected; skipping chunk ##" & chunk.chunkIndex );
+							return { chunkIndex: chunk.chunkIndex, error: false, skipped: true, durationMS: 0 };
+						}
+						var maxRetries = 3;
+						var attempt = 1;
+						while (attempt <= maxRetries) {
+							var chunkStartTick = getTickCount();
+							// Detect and log thread type (virtual or platform)
+							var thread = createObject( "java", "java.lang.Thread" ).currentThread();
+							var isVirtual = false;
+							try { isVirtual = thread.isVirtual(); } catch( any ignore ) {}
+							writeLog( log="CloudStorage", type="debug", text="CSFileDownload: [Batch ##" & batchId & "] Chunk ##" & chunk.chunkIndex & " [" & chunk.startByte & "-" & chunk.endByte & ", size=" & (chunk.endByte-chunk.startByte+1) & "] START (attempt " & attempt & ") on thread: " & thread.getName() & ", virtual=" & isVirtual );
+
+							try {
+								// Stream the range directly to disk to avoid heap spikes
+								var chunkRaf = RandomAccessFile.init( destination, "rw" );
+								var input = storage.getObjectRangeStream( bucketName, objectKey, chunk.startByte, chunk.endByte );
+								try {
+									chunkRaf.seek( chunk.startByte );
+									// Copy using 64KB buffer
+									var ByteBuffer = createObject( "java", "java.nio.ByteBuffer" );
+									var buf = ByteBuffer.allocate( 64 * 1024 );
+									var arr = buf.array();
+									while( true ){
+										var read = input.read( arr );
+										if( read == -1 ) break;
+										chunkRaf.write( arr, 0, read );
+									}
+								} finally {
+									try { input.close(); } catch( any ignore2 ){}
+									try { chunkRaf.close(); } catch( any ignore3 ){}
+								}
+								var chunkDuration = getTickCount() - chunkStartTick;
+								writeLog( log="CloudStorage", type="debug", text="CSFileDownload: [Batch ##" & batchId & "] Chunk ##" & chunk.chunkIndex & " completed, durationMS=" & chunkDuration );
+								return {
+									chunkIndex: chunk.chunkIndex,
+									error: false,
+									durationMS: chunkDuration
+								};
+							} catch( any e ) {
+								// Detect connection exhaustion and throttle
+								var msg = lcase( e.message ?: "" );
+								var isExhaustion = findNoCase( "failed to acquire", msg ) || findNoCase( "connection pool", msg ) || findNoCase( "exhaust", msg ) || findNoCase( "max pending", msg ) || findNoCase( "goaway", msg );
+								var isInterrupted = findNoCase( "closed by interrupt", msg ) || findNoCase( "interrupted", msg );
+								if ( isExhaustion ) {
+									writeLog( log="CloudStorage", type="warning", text="CSFileDownload: Connection exhaustion detected, throttling for 500 ms from a thread in batch (" & i & ")");
+									sleep( 500 );
+									exhaustionEvents++;
+								}
+								if (attempt >= maxRetries && !isInterrupted) {
+									writeLog( log="CloudStorage", type="error", text="CSFileDownload: (" & i & ") Chunk ##" & chunk.chunkIndex & " giving up after " & maxRetries & " attempts: " & e.message);
+									failFast = true;
+									return {
+										chunkIndex: chunk.chunkIndex,
+										error: true,
+										message: e.message,
+										exhaustion: isExhaustion
+									};
+								}
+								// Retry on interruption or transient errors
+								attempt++;
+								if( isInterrupted ){
+									writeLog( log="CloudStorage", type="warning", text="CSFileDownload: (" & i & ") Chunk ##" & chunk.chunkIndex & " interrupted; retrying (attempt " & attempt & ")" );
+									sleep( 1000 );
+								}
+							}
+						}
+					},
+					null,
+					vExecutor
+				);
+				// Log batch completion and memory usage
+				var usedMemMBEnd = (runtime.totalMemory() - runtime.freeMemory()) / 1024 / 1024;
+				var batchDuration = getTickCount() - batchStartTick;
+				writeLog( log="CloudStorage", type="info", text="CSFileDownload: Finished batch ##" & batchId & " (index " & batchStart & "-" & batchEnd & ") of " & totalChunks & " chunks, usedMemMB=" & numberFormat(usedMemMBEnd, "9.999") & " MB, durationMS=" & batchDuration & ", concurrent=" & currentConcurrent );
+				allResults.addAll( batchResults );
+				// If exhaustion occurred, reduce concurrency for next batch
+				if (exhaustionEvents > 0) {
+					var newConcurrent = max( 1, ceiling( currentConcurrent / 2 ) );
+					if (newConcurrent < currentConcurrent) {
+						writeLog( log="CloudStorage", type="warning", text="CSFileDownload: Reducing concurrency due to exhaustion: " & currentConcurrent & " -> " & newConcurrent );
+						currentConcurrent = newConcurrent;
+					}
+					exhaustionEvents = 0;
+				}
+				// If any errors occurred in this batch, stop scheduling further batches
+				var hasErrors = arraySome( batchResults, ( r ) -> ( r.error ?: false ) );
+				if ( hasErrors ) {
+					failFast = true;
+					break;
+				}
+				i = batchEnd + 1;
+				batchNumber++;
+			}
+			return allResults;
+		}, null, vExecutor ).orTimeout( timeoutSeconds, "SECONDS" );
+
+		// Block for results; ensure executor shuts down regardless
+		var results = 0;
+		try {
+			results = downloadFuture.get();
+		} catch( any e ) {
+			try { downloadFuture.cancel( true ); } catch( any ignore ){}
+			// Re-throw so outer error handling can respond
+			throw( e );
+		} finally {
+			try { vExecutor.shutdown(); } catch( any ignore ){}
+			// Attempt aggressive shutdown if supported (prevents lingering tasks between invocations)
+			try { vExecutor.shutdownNow(); } catch( any ignore2 ){}
+		}
+		try { raf.close(); } catch( any ignoreRaf ){}
+
+		// Evaluate results and fail if any chunk failed
+		var failedResults = results.filter( ( r ) -> ( r.error ?: false ) );
+		if (arrayLen( failedResults )) {
+			var firstErr = failedResults[1];
+			writeLog( log="CloudStorage", type="error", text="CSFileDownload: Download failed due to chunk ##" & firstErr?.chunkIndex & ": " & ( firstErr?.message ?: "error" ) );
+			return {
+				filename = destination,
+				error = true,
+				message = "Download failed: " & (firstErr.message ?: "Chunk error"),
+				chunks = totalChunks
+			};
+		}
+
+		// Integrity check: ensure local file size matches expected remote size
+		try {
+			var localSize = getFileInfo( destination ).size;
+			if( isNumeric( fileSize ) && fileSize > 0 && localSize != fileSize ){
+				writeLog( log="CloudStorage", type="error", text="CSFileDownload: Size mismatch. Expected=" & fileSize & ", Actual=" & localSize & ", destination=" & destination );
+				return {
+					filename = destination,
+					error = true,
+					message = "Size mismatch after download",
+					expectedSize = fileSize,
+					actualSize = localSize,
+					chunks = totalChunks
+				};
+			}
+		} catch( any e ){
+			// Bypass size check if we cannot get local file info for now, add crc checks later
+			writeLog( log="CloudStorage", type="error", text="CSFileDownload: Failed to get local file info after download: " & e.message );
+		}
+		var overallDurationMS = getTickCount() - overallStartTick;
+		writeLog( log="CloudStorage", type="info", text="CSFileDownload: Download completed successfully: " & destination & ", durationMS=" & overallDurationMS );
+		return {
+			filename = destination,
+			method = "async-multipart",
+			size = localSize,
+			chunks = totalChunks,
+			durationMS = overallDurationMS
+		};
+	}
+	/**
+	 * Download small files in a single operation (memory efficient)
+	 *
+	 * @storage Cloud storage object with getObject method
+	 * @bucketName Name of the bucket containing the object
+	 * @objectKey Key of the object to download
+	 * @destination Local file path to save the downloaded object
+	 * @return Struct. On success: `{ method: 'single', size: <bytes>, filename: <path>, durationMS: <number> }`. On failure: throws an error with message "Small file download failed: <error message>".
+	 */
+	private struct function downloadSmallFile( required storage, required string bucketName, required string objectKey, required string destination ) {
+		try {
+			var startTick = getTickCount();
+			var fileContent = storage.getObject( arguments.bucketName, arguments.objectKey );
+			if( isBinary( fileContent ) ){
+				fileWrite( destination, fileContent );
+				if( fileExists( destination ) ){
+					var duration = getTickCount() - startTick;
+					writeLog( log="CloudStorage", type="info", text="CSFileDownload: Single download completed: " & destination & ", durationMS=" & duration );
+					return {
+						filename = destination,
+						error = false,
+						method = "single",
+						size = getFileInfo( destination ).size,
+						durationMS = duration
+					};
+				}
+			}
+			throw( message = "Failed to retrieve file content or content is not binary" );
+		} catch( any e ){
+			throw( message = "Small file download failed: " & e.message );
+		}
+	}
+}

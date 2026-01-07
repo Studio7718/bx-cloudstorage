@@ -1,0 +1,22 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/" {
+    function beforeAll(){
+        super.beforeAll();
+    }
+    function run(){
+        // Load config from environment
+        var testPathS3         = getSystemSetting("S3_TEST_PATH_S3", "s3:///my-test-bucket/test-dir/");
+
+        describe( 'CSDirectoryExists BIF (env-configured)', () => {
+            it( 'returns boolean for configured S3 path', () => {
+                var exists = CSDirectoryExists( testPathS3 );
+                expect( isBoolean( exists ) ).toBeTrue();
+            });
+
+            it( 'returns false for random non-existent subpath', () => {
+                var rand = lcase( replace( createUUID(), '-', '', 'all' ) );
+                var missing = testPathS3 & 'missing-' & rand & '/';
+                expect( CSDirectoryExists( missing ) ).toBeFalse();
+            });
+        });
+    }
+}

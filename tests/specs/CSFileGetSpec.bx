@@ -1,0 +1,50 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/" {
+    function beforeAll(){
+        super.beforeAll();
+        // Env-driven values similar to CSDirectoryExistsSpec
+        variables.testPathS3         = getSystemSetting("S3_TEST_PATH_S3", "s3:///my-test-bucket/test-dir/");
+        variables.testLocalFileSmall = getSystemSetting("S3_TEST_LOCAL_FILE_SMALL", "/tmp/s3test/small.txt");
+
+        // Ensure a small local file exists for upload
+        if( !fileExists( variables.testLocalFileSmall ) ){
+            directoryCreate( getDirectoryFromPath( variables.testLocalFileSmall ), true );
+            fileWrite( variables.testLocalFileSmall, repeatString( "x", 1024 ) );
+        }
+    }
+
+    function run(){
+        var rand   = lcase( replace( createUUID(), '-', '', 'all' ) );
+        var s3Key  = variables.testPathS3 & 'fileget-' & rand & '.txt';
+        var outLocal = getTempDirectory() & 'fileget-' & rand & '.bin';
+        if( fileExists( outLocal ) ) fileDelete( outLocal );
+
+        describe( 'CSFileGet BIF (env-configured)', () => {
+            it( 'downloads object bytes that can be written to disk', () => {
+                // Upload a temp file to S3
+                var up = CSFileCopy( source = variables.testLocalFileSmall, destination = s3Key );
+                expect( up.success ?: (! ( up.error ?: false )) ).toBeTrue();
+
+                // Get object data
+                var data = CSFileGet( s3Key );
+                expect( isNull( data ) ).toBeFalse();
+
+                // Write to local file to validate content usability across strategies
+                fileWrite( outLocal, data );
+                expect( fileExists( outLocal ) ).toBeTrue();
+                expect( fileSize( outLocal ) ).toBeGT( 0 );
+
+                // Cleanup S3 object
+                var del = CSFileDelete( s3Key );
+                expect( del.success ?: true ).toBeTrue();
+            });
+
+            it( 'returns null for a missing object', () => {
+                var missing = CSFileGet( s3Key & '.missing' );
+                expect( isNull( missing ) ).toBeTrue();
+            });
+        });
+
+        // Cleanup local temp
+        try { if( fileExists( outLocal ) ) fileDelete( outLocal ); } catch( any ignore ){}
+    }
+}

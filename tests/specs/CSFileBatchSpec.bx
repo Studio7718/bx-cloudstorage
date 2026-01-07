@@ -1,0 +1,65 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/" {
+    function beforeAll(){
+        super.beforeAll();
+        // Env-driven values
+        variables.testPathS3         = getSystemSetting("S3_TEST_PATH_S3", "s3:///my-test-bucket/test-dir/");
+        variables.testLocalPath      = getSystemSetting("S3_TEST_LOCAL_PATH", "/tmp/s3test/");
+        variables.testLocalFileSmall = getSystemSetting("S3_TEST_LOCAL_FILE_SMALL", "/tmp/s3test/small.txt");
+        variables.testLocalFileLarge = getSystemSetting("S3_TEST_LOCAL_FILE_LARGE", "/tmp/s3test/large.bin");
+
+        // Ensure local dir/files present
+        if( !directoryExists( variables.testLocalPath ) ) directoryCreate( variables.testLocalPath, true );
+        if( !fileExists( variables.testLocalFileSmall ) ) fileWrite( variables.testLocalFileSmall, repeatString( "a", 1024 ) );
+        if( !fileExists( variables.testLocalFileLarge ) ){
+            var chunk = repeatString( "b", 1024 );
+            var out = createObject( 'java', 'java.io.FileOutputStream' ).init( variables.testLocalFileLarge );
+            try { for( var i=1; i<=256; i++ ) out.write( toBinary( toBase64( chunk ) ) ); } finally { out.close(); }
+        }
+    }
+
+    function run(){
+        var rand = lcase( replace( createUUID(), '-', '', 'all' ) );
+        var s3Folder = variables.testPathS3 & 'batchdl-' & rand & '/';
+
+        var smallName = listLast( variables.testLocalFileSmall, '/' );
+        var largeName = listLast( variables.testLocalFileLarge, '/' );
+        var s3Small   = s3Folder & smallName;
+        var s3Large   = s3Folder & largeName;
+
+        // Local download targets
+        var dest1 = variables.testLocalPath & 'dl-' & rand & '-' & smallName;
+        var dest2 = variables.testLocalPath & 'dl-' & rand & '-' & largeName;
+        if( fileExists( dest1 ) ) fileDelete( dest1 );
+        if( fileExists( dest2 ) ) fileDelete( dest2 );
+
+        describe( 'CSFileUploadBatch + CSFileDownloadBatch (env-configured, two-file array)', () => {
+            it( 'uploads two local files to S3, then downloads both', () => {
+                // Batch upload two local files to S3 test folder
+                var upBatch = CSFileUploadBatch(
+                    sources      = [ variables.testLocalFileSmall, variables.testLocalFileLarge ],
+                    destinations = [ s3Small, s3Large ],
+                    concurrency  = 2
+                );
+                expect( upBatch.success ).toBeTrue();
+                expect( arrayLen( upBatch.results ) ).toBe( 2 );
+                expect( ( upBatch.errors ?: [] ).len() ).toBe( 0 );
+
+                // Batch download
+                var dlBatch = CSFileDownloadBatch(
+                    sources      = [ s3Small, s3Large ],
+                    destinations = [ dest1, dest2 ],
+                    concurrency  = 2
+                );
+                expect( dlBatch.success ).toBeTrue();
+                expect( arrayLen( dlBatch.results ) ).toBe( 2 );
+                expect( fileExists( dest1 ) ).toBeTrue();
+                expect( fileExists( dest2 ) ).toBeTrue();
+            });
+        });
+
+        // Cleanup created resources
+        try { if( fileExists( dest1 ) ) fileDelete( dest1 ); } catch( any ignore ){}
+        try { if( fileExists( dest2 ) ) fileDelete( dest2 ); } catch( any ignore ){}
+        try { CSDirectoryDelete( s3Folder ); } catch( any ignore ){}
+    }
+}

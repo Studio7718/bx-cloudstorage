@@ -1,0 +1,89 @@
+/**
+ * This is a BOXLANG BIF.  Please note that all BIFs are registered
+ * as singletons.
+ *
+ * Annotations you can use on a BIF:
+ * <pre>
+ * // The alias of the BIF, defaults to the name of the Class
+ * @BoxBIF - The BIF is registered as the name of the class
+ * @BoxBIF( 'myBifAlias' ) - Register with the specific name
+ * @BoxBIF( [ 'myBifAlias', 'myOtherBifAlias' ] ) - Register with all these names
+ * @BoxMember( 'string' ) : Register also as a member method on strings.
+ * @BoxMember( { 'string' : { name : '', objectArgument : '' }, 'array' : { name : '', objectArgument : '' } } ) - Register on multiple types
+ * </pre>
+ *
+ */
+@BoxBIF
+class {
+	/**
+	 * Batch upload local files to Cloud Storage asynchronously using CSFileUpload BIF.
+	 *
+	 * @sources        Array of local file paths to upload
+	 * @destinations   Array of Cloud Storage destinations (full s3://bucket/key or relative key handled by CSFileUpload)
+	 * @concurrency    Maximum parallel uploads (default 5)
+	 * @failFast       If true, abort remaining futures on first error
+	 * @return struct  { success:boolean, results:array, errors:array, elapsed:numeric }
+	 */
+	struct function invoke( required array sources, required array destinations, numeric concurrency=5, boolean failFast=false ) {
+		var startedAt=getTickCount();
+		var errors=[];
+		var results=[];
+
+		// Basic validations
+		if( arrayLen( arguments.sources ) == 0 ) return { success=true, results=[], errors=[], elapsed=0 };
+		if( arrayLen( arguments.sources ) != arrayLen( arguments.destinations ) ) throw( message='CSFileUploadBatch: sources and destinations length mismatch' );
+		if( arguments.concurrency < 1 ) arguments.concurrency=1;
+
+		// Helper to spawn a future for a single pair
+		var spawn=( src, dest ) -> futureNew( () => {
+			try { return { ok=true, data=CSFileUpload( source=src, destination=dest ) }; }
+			catch( any e ) { return { ok=false, data={ error=true, message=e.message, bucketName:'', objectKey:'' } }; }
+		} );
+
+		var queueIndex=1;
+		var active=[];
+
+		// Prime initial futures up to concurrency limit
+		while( queueIndex <= arrayLen( arguments.sources ) && arrayLen( active ) < arguments.concurrency ){
+			arrayAppend( active, spawn( arguments.sources[ queueIndex ], arguments.destinations[ queueIndex ] ) );
+			queueIndex++;
+		}
+
+		// Processing loop
+		while( arrayLen( active ) ){
+			var stillActive=[];
+			for( var f in active ){
+				var done=false;
+				try { done=f.isDone(); } catch( any ignore ){ done=true; }
+				if( done ){
+					var out={};
+					try { out=f.get(); } catch( any eg ){ out={ ok=false, data={ error=true, message=eg.message } }; }
+					if( out.ok ){
+						arrayAppend( results, out.data );
+					} else {
+						arrayAppend( errors, out.data );
+						if( arguments.failFast ){
+							// Attempt cancellation of remaining futures
+							for( var cf in active ){
+								try { if( structKeyExists( cf, 'cancel' ) ) cf.cancel(); } catch( any ignore ){}
+							}
+							return { success=false, results=results, errors=errors, elapsed=( getTickCount()-startedAt ) };
+						}
+					}
+					// Spawn next queued future if any remain
+					if( queueIndex <= arrayLen( arguments.sources ) ){
+						arrayAppend( stillActive, spawn( arguments.sources[ queueIndex ], arguments.destinations[ queueIndex ] ) );
+						queueIndex++;
+					}
+				} else {
+					arrayAppend( stillActive, f );
+				}
+			}
+			active=stillActive;
+			if( arrayLen( active ) ) sleep( 25 );
+		}
+
+		return { success=( arrayLen( errors ) == 0 ), results=results, errors=errors, elapsed=( getTickCount() - startedAt ) };
+	}
+
+}

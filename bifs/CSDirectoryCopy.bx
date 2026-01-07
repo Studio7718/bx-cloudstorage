@@ -1,0 +1,199 @@
+/**
+ * This is a BOXLANG BIF.  Please note that all BIFs are registered
+ * as singletons.
+ *
+ * Annotations you can use on a BIF:
+ * <pre>
+ * The alias of the BIF, defaults to the name of the Class
+ * @BoxBIF - The BIF is registered as the name of the class
+ * @BoxBIF( 'myBifAlias' ) - Register with the specific name
+ * @BoxBIF( [ 'myBifAlias', 'myOtherBifAlias' ] ) - Register with all these names
+ * @BoxMember( 'string' ) : Register also as a member method on strings.
+ * @BoxMember( { 'string' : { name : '', objectArgument : '' }, 'array' : { name : '', objectArgument : '' } } ) - Register on multiple types
+ * </pre>
+ *
+ */
+import bxModules.bxcloudstorage.models.CloudStorageService;
+
+@BoxBIF
+class {
+	/**
+	 * Copy a directory tree between local filesystem and S3.
+	 * - local -> s3 : batch upload
+	 * - s3 -> local : batch download
+	 * - s3 -> s3   : fallback two-phase (download to temp, then upload) using batch BIFs
+	 * Returns summary with results/errors.
+	 *
+	 * @source       Source directory (local path or s3:///bucket/prefix)
+	 * @destination  Destination directory (local path or s3:///bucket/prefix)
+	 * @recurse      Recurse into subdirectories (default true)
+	 * @concurrency  Max parallel transfers for batch BIFs (default 5)
+	 * @failFast     Abort batch on first error (default false)
+	 * @return struct { success:boolean, operation:string, results:array, errors:array, elapsed:numeric, message:string }
+	 */
+	struct function invoke( required string source, required string destination, boolean recurse=true, numeric concurrency=5, boolean failFast=false ) {
+		var startedAt = getTickCount();
+		var cs = new CloudStorageService();
+		// Allow relative cloud keys via S3_BUCKET setting when provided
+		var s3BucketSetting = getSystemSetting( 'S3_BUCKET', '' );
+		var src = cs.resolvePath( arguments.source, s3BucketSetting );
+		var dest = cs.resolvePath( arguments.destination, s3BucketSetting );
+		var isSourceS3 = src.isCloud;
+		var isDestS3   = dest.isCloud;
+
+		// Normalize trailing slashes for directory semantics
+		var srcPath  = arguments.source;
+		var destPath = arguments.destination;
+		if( right( srcPath, 1 ) != '/' ) srcPath &= '/';
+		if( right( destPath, 1 ) != '/' ) destPath &= '/';
+
+		// Helper to ensure local destination root exists
+		var ensureDir = ( path ) -> { if( !directoryExists( path ) ) directoryCreate( path, true ); };
+
+		// local -> s3 (upload directory tree)
+		if( !isSourceS3 && isDestS3 ){
+			if( !directoryExists( srcPath ) ) return { success=false, operation='upload-batch', results=[], errors=[ { message='Source directory not found' } ], elapsed=0, message='Source directory not found' };
+			// Collect local files recursively
+			var fileList = directoryList( srcPath, arguments.recurse, 'path', '*', 'files' );
+			if( !isArray( fileList ) ) fileList = [];
+			// Map to destination S3 URIs
+			var uploads = [];
+			var sources = [];
+			var destinations = [];
+			for( var f in fileList ){
+				var rel = replaceNoCase( f, srcPath, '' );
+				// Guard: skip empty
+				if( !len( rel ) ) continue;
+				var s3Target = destPath & rel;
+				// Prepend s3:/// if not present in destination root (destPath already has it)
+				if( left( s3Target, len(dest.prefix) ) != dest.prefix ) s3Target = destPath & rel; // destPath includes s3:/// already
+				arrayAppend( sources, f );
+				arrayAppend( destinations, s3Target );
+			}
+			if( !arrayLen( sources ) ) return { success=true, operation='upload-batch', results=[], errors=[], elapsed=( getTickCount()-startedAt ), message='No files to upload' };
+			var batch = CSFileUploadBatch( sources=sources, destinations=destinations, concurrency=arguments.concurrency, failFast=arguments.failFast );
+			return { success=batch.success, operation='upload-batch', results=batch.results, errors=batch.errors, elapsed=batch.elapsed, message=( batch.success ? 'upload batch ok' : 'upload batch errors' ) };
+		}
+
+		// s3 -> local (download directory tree)
+		if( isSourceS3 && !isDestS3 ){
+			ensureDir( destPath );
+			// List S3 objects
+			var list = [];
+			try {
+				list = CSDirectoryList( path=srcPath, recurse=arguments.recurse, listInfo='path', type='file' );
+			} catch( any e ){
+				return { success=false, operation='download-batch', results=[], errors=[ { message=e.message } ], elapsed=( getTickCount()-startedAt ), message='Listing failed' };
+			}
+			if( !isArray( list ) || !arrayLen( list ) ) return { success=true, operation='download-batch', results=[], errors=[], elapsed=( getTickCount()-startedAt ), message='No objects to download' };
+			// Use parsed source descriptor for prefix mapping
+			var prefixKey = src.objectKey;
+			var sources = [];
+			var destinations = [];
+			for( var uri in list ){
+				arrayAppend( sources, uri );
+				// Parse each object via CloudStorageService
+				var objInfo = cs.resolvePath( uri );
+				if( !objInfo.isCloud ) continue;
+				var rel = replaceNoCase( objInfo.objectKey, prefixKey, '' );
+				var localFile = destPath & rel;
+				arrayAppend( destinations, localFile );
+			}
+			var batch = CSFileDownloadBatch( sources=sources, destinations=destinations, concurrency=arguments.concurrency, failFast=arguments.failFast );
+			return { success=batch.success, operation='download-batch', results=batch.results, errors=batch.errors, elapsed=batch.elapsed, message=( batch.success ? 'download batch ok' : 'download batch errors' ) };
+		}
+
+		// s3 -> s3 (server-side copyObject per object; avoids local transfer)
+		if( isSourceS3 && isDestS3 ){
+			// List S3 objects under source
+			var list = [];
+			try {
+				list = CSDirectoryList( path=srcPath, recurse=arguments.recurse, listInfo='path', type='file' );
+			} catch( any e ){
+				return { success=false, operation='server-copy-batch', results=[], errors=[ { message=e.message } ], elapsed=( getTickCount()-startedAt ), message='Listing failed' };
+			}
+			if( !arrayLen( list ) ) return { success=true, operation='server-copy-batch', results=[], errors=[], elapsed=( getTickCount()-startedAt ), message='No objects to copy' };
+
+			// Use parsed descriptors
+			var srcPrefix = src.objectKey;
+			var destPrefix = dest.objectKey;
+
+			// Build copy tasks (sourceKey -> destinationKey)
+			var sources = [];
+			var destinations = [];
+			var sourceUris = [];
+			var destUris = [];
+			for( var uri in list ){
+				var objInfo = cs.resolvePath( uri );
+				if( !objInfo.isCloud ) continue;
+				var rel = replaceNoCase( objInfo.objectKey, srcPrefix, '' );
+				var targetKey = destPrefix & rel;
+				arrayAppend( sources, objInfo.objectKey );
+				arrayAppend( destinations, targetKey );
+				arrayAppend( sourceUris, src.prefix & src.bucketName & "/" & objInfo.objectKey );
+				arrayAppend( destUris, dest.prefix & dest.bucketName & "/" & targetKey );
+			}
+
+			// Concurrency-controlled server-side copy
+			var errors = [];
+			var results = [];
+			var queueIndex = 1;
+			var active = [];
+			var spawn = ( sUri, dUri ) -> futureNew( () => {
+				try {
+					var resp = CSFileCopy( source=sUri, destination=dUri );
+					var ok = resp.success ?: true;
+					return { ok: ok, data: resp };
+				} catch( any ce ){
+					return { ok:false, data={ message=ce.message, source=sUri, destination=dUri } };
+				}
+			} );
+
+			// Prime initial futures
+			while( queueIndex <= arrayLen( sourceUris ) && arrayLen( active ) < arguments.concurrency ){
+				arrayAppend( active, spawn( sourceUris[ queueIndex ], destUris[ queueIndex ] ) );
+				queueIndex++;
+			}
+
+			// Processing loop
+			while( arrayLen( active ) ){
+				var stillActive = [];
+				for( var f in active ){
+					var done = false;
+					try { done = f.isDone(); } catch( any ignore ){ done = true; }
+					if( done ){
+						var out = {};
+						try { out = f.get(); } catch( any eg ){ out = { ok:false, data={ message=eg.message } }; }
+						if( out.ok ){
+							arrayAppend( results, out.data );
+						} else {
+							arrayAppend( errors, out.data );
+							if( arguments.failFast ){
+								// Attempt cancellation of remaining futures
+								for( var cf in active ){
+									try { if( structKeyExists( cf, 'cancel' ) ) cf.cancel(); } catch( any ignore ){}
+								}
+								return { success=false, operation='server-copy-batch', results=results, errors=errors, elapsed=( getTickCount()-startedAt ), message='Server-side copy failed (failFast)' };
+							}
+						}
+						// Spawn next queued future if any remain
+						if( queueIndex <= arrayLen( sourceUris ) ){
+							arrayAppend( stillActive, spawn( sourceUris[ queueIndex ], destUris[ queueIndex ] ) );
+							queueIndex++;
+						}
+					} else {
+						arrayAppend( stillActive, f );
+					}
+				}
+				active = stillActive;
+				if( arrayLen( active ) ) sleep( 25 );
+			}
+
+			return { success=( arrayLen( errors ) == 0 ), operation='server-copy-batch', results=results, errors=errors, elapsed=( getTickCount()-startedAt ), message=( arrayLen( errors ) ? 'Server-side copy errors' : 'Server-side copy ok' ) };
+		}
+
+		// Unsupported combination
+		return { success=false, operation='none', results=[], errors=[ { message='Source/Destination combination unsupported.' } ], elapsed=( getTickCount()-startedAt ), message='Unsupported combination' };
+	}
+
+}

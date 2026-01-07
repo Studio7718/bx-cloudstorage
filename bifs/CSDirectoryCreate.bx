@@ -1,0 +1,39 @@
+/**
+ * This is a BOXLANG BIF.  Please note that all BIFs are registered
+ * as singletons.
+ *
+ * Annotations you can use on a BIF:
+ * <pre>
+ * // The alias of the BIF, defaults to the name of the Class
+ * @BoxBIF - The BIF is registered as the name of the class
+ * @BoxBIF( 'myBifAlias' ) - Register with the specific name
+ * @BoxBIF( [ 'myBifAlias', 'myOtherBifAlias' ] ) - Register with all these names
+ * @BoxMember( 'string' ) : Register also as a member method on strings.
+ * @BoxMember( { 'string' : { name : '', objectArgument : '' }, 'array' : { name : '', objectArgument : '' } } ) - Register on multiple types
+ * </pre>
+ *
+ */
+import bxModules.bxcloudstorage.models.CloudStorageService;
+
+@BoxBIF
+class {
+
+    /**
+     * Create a logical directory placeholder in S3 (zero-byte object with trailing slash).
+     *
+     * @path Cloud path to the directory, e.g. `s3:///bucket/prefix/` (trailing `/` recommended; relative keys resolved).
+     * @return Struct from provider indicating `{ success:boolean, existed:boolean, created:boolean }` where available; on error includes `message`.
+     */
+    struct function invoke( required string path ) {
+        try {
+           // Use CloudStorageService to get the storage and parse path
+            var cloud = new CloudStorageService().getStorageForPath( arguments.path );
+
+            return cloud.storage.createDirectory( cloud.bucketName, cloud.objectKey );
+
+        } catch( any e ){
+            return { success = false, message = 'CSDirectoryCreate failed: ' & e.message, existed=false, created=false };
+        }
+    }
+
+}

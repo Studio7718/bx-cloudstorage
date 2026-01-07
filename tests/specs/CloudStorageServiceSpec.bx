@@ -1,0 +1,68 @@
+class extends="BaseTestCase" {
+
+	function beforeAll(){
+		super.beforeAll();
+		CloudStorageService = getInstance( "CloudStorageService@bxcloudstorage" );
+	}
+
+	function run(){
+		// Load env-driven settings similar to CSDirectoryExistsSpec
+		var testPathS3         = getSystemSetting("S3_TEST_PATH_S3", "s3:///my-test-bucket/test-dir/");
+		var testLocalPath      = getSystemSetting("S3_TEST_LOCAL_PATH", "/tmp/s3test/");
+
+		// Parse bucket/key from testPathS3 (support s3:// and s3:///)
+		var trimmed = replace( testPathS3, "s3://", "", "one" );
+		if( left( trimmed, 1 ) == "/" ) trimmed = trimmed.substr( 1 );
+		var slashPos = find( "/", trimmed );
+		var envBucket = slashPos ? left( trimmed, slashPos - 1 ) : trimmed;
+		var envKey    = slashPos ? mid( trimmed, slashPos + 1 ) : "";
+
+		describe( "CloudStorageService (env-configured)", () => {
+
+			it( "is available via DI", () => {
+				expect( CloudStorageService ).toBeDefined();
+			});
+
+			it( "isCloudPath detects s3 vs local", () => {
+				expect( CloudStorageService.isCloudPath( testPathS3 ) ).toBeTrue();
+				expect( CloudStorageService.isCloudPath( testLocalPath ) ).toBeFalse();
+			});
+
+			it( "resolvePath parses s3 path", () => {
+				var r = CloudStorageService.resolvePath( testPathS3 );
+				expect( r.isCloud ).toBeTrue();
+				expect( r.bucketName ).toBe( envBucket );
+				// objectKey may be directory; ensure prefix starts with envKey
+				expect( left( r.objectKey, len( envKey ) ) ).toBe( envKey );
+			});
+
+			it( "resolvePath parses local path", () => {
+				var r = CloudStorageService.resolvePath( testLocalPath );
+				expect( r.isCloud ).toBeFalse();
+				expect( r.localPath ).toBe( testLocalPath );
+			});
+
+			it( "getStorageForPath returns strategy and parsed parts", () => {
+				var s = CloudStorageService.getStorageForPath( testPathS3 );
+				expect( isDefined( "s.storage" ) ).toBeTrue();
+				expect( isCustomFunction( s.storage.generatePresignedURL ) ).toBeTrue();
+				expect( s.bucketName ).toBe( envBucket );
+				expect( left( s.objectKey, len( envKey ) ) ).toBe( envKey );
+			});
+
+			it( "getStorageForPath supports relative key with bucket from env", () => {
+				var relativeKey = "sub/dir/file.txt";
+				var s = CloudStorageService.getStorageForPath( relativeKey, envBucket );
+				expect( s.bucketName ).toBe( envBucket );
+				expect( right( s.objectKey, len( relativeKey ) ) ).toBe( relativeKey );
+			});
+
+			it( "getCloudStorage returns vendor strategy", () => {
+				var strat = CloudStorageService.getCloudStorage();
+				expect( isCustomFunction( strat.listObjects ) ).toBeTrue();
+				expect( isCustomFunction( strat.getObjectMetadata ) ).toBeTrue();
+			});
+
+		});
+	}
+}
