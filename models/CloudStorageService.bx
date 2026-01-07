@@ -1,0 +1,275 @@
+import bxModules.bxcloudstorage.models.vendor.aws.*;
+
+class singleton {
+	/*
+	CloudStorageService: S3 functionality for (BIFs)
+
+	Purpose
+	- Provide a centralized place for S3 operations used by the module.
+	*/
+	@inject
+	property name="wirebox";
+	/**
+	 * Returns an instance of the best available Cloud Storage Strategy
+	 */
+	public ICloudStorageStrategy function getCloudStorage( string vendor="aws-s3" ){
+		switch ( arguments.vendor ) {
+			// Use AWS S3 Cloud Storage
+			case "aws-s3":
+			default: {
+				// Java SDK
+				try {
+					var strategy = new bxModules.bxcloudstorage.models.vendor.aws.S3JavaSDKStrategy();
+					writeLog( log="CloudStorage", text="CloudStorageService: Successfully created S3JavaSDKStrategy", type="debug" );
+					return strategy;
+				} catch( any e ){
+					writeLog( log="CloudStorage", text="CloudStorageService: Java SDK strategy failed - #e.message# Detail: #e.detail ?: '--'#", type="error" );
+				}
+			}
+		}
+
+		throw( message = "No valid Cloud Storage strategy available. Please ensure settings are correct and preferred vendor modules are loaded if using them." );
+	}
+	/**
+	 * Resolve a CBFS disk if the CBFS module is loaded; otherwise return null.
+	 *
+	 * Detection Strategy:
+	 * 1. Look for an injected/variables scope 'cbfs' reference.
+	 * 2. Attempt WireBox lookup of 'cbfs@cbfs' (moduleID@mapping).
+	 * 3. If service located, validate requested disk name (if provided) via 'hasDisk()'.
+	 * 4. If no diskName passed, attempt to obtain the default disk using 'getDefaultDisk()';
+	 *    if that method isn't present, fall back to common property names or a conventional 'default' disk.
+	 * Returns the disk object or null when unavailable/not found.
+	 *
+	 * @diskName (optional) specific disk to resolve
+	 * @return any|null
+	 */
+	public any function getCbfsDisk( string diskName = "" ){
+		// Allow configured module name via settings; default 'cbfs'
+		var service = getCBFS();
+		if( isNull( service ) ) return null; // CBFS not available
+
+		// Check: ensure service exposes hasDisk()/getDisk
+		try {
+			if( !structKeyExists( service, 'hasDisk' ) || !structKeyExists( service, 'getDisk' ) ) return null;
+		} catch( any ignore ){
+			return null;
+		}
+
+		// If caller requested a specific disk
+		if( len( arguments.diskName ) ){
+			try { return service.hasDisk( arguments.diskName ) ? service.getDisk( arguments.diskName ) : null; } catch( any ignore ){ return null; }
+		}
+
+		// Obtain default disk heuristically
+		var defaultName = '';
+		try {
+			if( structKeyExists( service, 'getDefaultDisk' ) ){
+				defaultName = service.getDefaultDisk();
+			} else if( structKeyExists( service, 'defaultDisk' ) ){
+				defaultName = service.defaultDisk;
+			} else if( structKeyExists( service, 'default' ) ){
+				defaultName = service.default;
+			}
+		} catch( any ignore ){}
+
+		// Fallback: if no name resolved but there is a 'local' disk, use it
+		if( !len( defaultName ) ){
+			try { if( service.hasDisk( 'local' ) ) defaultName = 'local'; } catch( any ignore ){}
+		}
+
+		if( len( defaultName ) ){
+			try { return service.hasDisk( defaultName ) ? service.getDisk( defaultName ) : null; } catch( any ignore ){ return null; }
+		}
+		return null;
+	}
+
+	/**
+	 * Returns true when the given path is a cloud (S3) URI.
+	 * Recognizes 's3:///bucket/key' form.
+	 */
+	public boolean function isCloudPath( required string path ){
+		// Direct S3 URI
+		if( left( arguments.path, 6 ) == "s3:///" ) return true;
+
+		// Relative key: treat as cloud if S3_BUCKET is defined and bucket exists
+		var envBucket = "";
+		try {
+			envBucket = getSystemSetting( "S3_BUCKET", "" );
+		} catch( any ignore ) {}
+		if( !len( envBucket ) ) return false;
+
+		// Optionally check for S3_PATH
+		var envPath = "";
+		try {
+			envPath = getSystemSetting( "S3_PATH", "" );
+		} catch( any ignore ) {}
+		var bucketName = listFirst( envBucket, '/' );
+		// Check if bucket exists using storage strategy
+		var storage = getCloudStorage( vendor="aws-s3" );
+		if( structKeyExists( storage, "bucketExists" ) ) {
+			try {
+				if( !storage.bucketExists( bucketName ) ) return false;
+			} catch( any ignore ) { return false; }
+		}
+		return true;
+	}
+
+	/**
+	 * Best-effort detection of local filesystem paths.
+	 * - Absolute POSIX: starts with '/'
+	 * - Windows absolute: 'C:/' or 'C:\\'
+	 * - Existing file or directory on disk
+	 */
+	public boolean function isLocalPath( required string path ){
+		var p = arguments.path ?: "";
+		if( !len( p ) ) return false;
+		if( left( p, 1 ) == "/" ) return true;
+		if( reFindNoCase( "^[A-Z]:[\\/]", p ) ) return true;
+		try { if( fileExists( p ) || directoryExists( p ) ) return true; } catch( any ignore ){}
+		return false;
+	}
+
+	/**
+	 * Resolve a path into a unified descriptor for use in BIFs.
+	 * Supports both cloud URIs (s3:///bucket/key) and local filesystem paths.
+	 * When a relative cloud key is provided, pass the bucket setting.
+	 *
+	 * @path   string  local or cloud path
+	 * @bucket string  optional bucket or bucket/prefix for relative cloud keys
+	 * @storage ICloudStorageStrategy optional storage strategy, resolved if missing
+	 * @return { isCloud:boolean, storage:ICloudStorageStrategy|null, bucketName:string, objectKey:string, prefix:string, localPath:string }
+	 */
+	public struct function resolvePath( required string path, string bucket = "", ICloudStorageStrategy storage ){
+		var descriptor = {
+			isCloud = false,
+			storage = null,
+			bucketName = "",
+			objectKey = "",
+			prefix = "/",
+			localPath = arguments.path
+		};
+		if( isCloudPath( arguments.path ) ){
+			var cloud = getStorageForPath( path=arguments.path, storage=arguments.storage ?: getCloudStorage( vendor="aws-s3" ) );
+			descriptor.isCloud    = true;
+			descriptor.storage    = cloud.storage;
+			descriptor.bucketName = cloud.bucketName;
+			descriptor.objectKey  = cloud.objectKey;
+			descriptor.prefix     = cloud.prefix;
+			//descriptor.localPath  = "";
+		} else if( len( arguments.bucket ) ){
+			// Only treat as relative cloud key when the path does NOT appear to be local
+			if( !isLocalPath( arguments.path ) ){
+				var cloudRel = getStorageForPath( path=arguments.path, bucket=arguments.bucket, storage=arguments.storage ?: getCloudStorage( vendor="aws-s3" ) );
+				descriptor.isCloud    = true;
+				descriptor.storage    = cloudRel.storage;
+				descriptor.bucketName = cloudRel.bucketName;
+				descriptor.objectKey  = cloudRel.objectKey;
+				descriptor.prefix     = cloudRel.prefix;
+				//descriptor.localPath  = "";
+			}
+		}
+		return descriptor;
+	}
+
+	/**
+	 * Parse a path and optional s3Bucket setting into a normalized
+	 * bucketName + objectKey pair.
+	 *
+	 * Rules:
+	 *  - If path starts with s3:/// then it is authoritative.
+	 *  - Else, s3Bucket must be provided (may include an internal prefix path).
+	 *  - Leading slash on path (when relative) will be trimmed.
+	 *  - Validates maximum lengths defensively; throws on invalid scenarios.
+	 *
+	 * @path string  Either full s3:///bucket/key or relative key
+	 * @s3Bucket  string  Optional configured bucket (can include prefix e.g. mybucket/path/root)
+	 * @return { bucketName:string, objectKey:string }
+	 */
+	public struct function getStorageForPath( required string path, string bucket = "", ICloudStorageStrategy storage ){
+		var cloud = { bucketName = "", objectKey = "", storage = arguments.storage ?: getCloudStorage( vendor="aws-s3" ), prefix = "s3:///" };
+
+		   // Full URL case
+		   if( left( arguments.path, len(cloud.prefix) ) == cloud.prefix ){
+			   var s3clean = replace( arguments.path, cloud.prefix, '', 'one' );
+			   // If s3clean is empty, or just "/", use default bucket from env
+			   if( !len( s3clean ) || s3clean == "/" ) {
+				   // Try to get S3_BUCKET from environment
+				   var envBucket = '';
+				   try {
+					   envBucket = getSystemSetting( "S3_BUCKET", "" );
+				   } catch( any ignore ) {}
+				   if( !len( envBucket ) ) {
+					   throw( message = 'getStorageForPath: No bucket specified in path or S3_BUCKET environment variable.' );
+				   }
+				   cloud.bucketName = listFirst( envBucket, '/' );
+				   var bucketPrefix = '';
+				   if( listLen( envBucket, '/' ) > 1 ){
+					   bucketPrefix = listRest( envBucket, '/' ) & '/';
+				   }
+				   // Check for S3_PATH env var
+				   var envPath = '';
+				   try {
+					   envPath = getSystemSetting( "S3_PATH", "" );
+				   } catch( any ignore ) {}
+				   if( len( envPath ) ) {
+					   // Ensure trailing slash
+					   if( right( envPath, 1 ) != '/' ) envPath &= '/';
+					   bucketPrefix &= envPath;
+				   }
+				   cloud.objectKey = bucketPrefix;
+				   return cloud;
+			   }
+			   cloud.bucketName = listFirst( s3clean, '/' );
+			   cloud.objectKey  = replace( s3clean, cloud.bucketName & '/', '', 'one' );
+			   return cloud;
+		   }
+		   // Relative key requires s3Bucket configuration
+		   if( !len( arguments.bucket ) ){
+			   // Use S3_BUCKET and S3_PATH if available
+			   var envBucket = '';
+			   try {
+				   envBucket = getSystemSetting( "S3_BUCKET", "" );
+			   } catch( any ignore ) {}
+			   if( !len( envBucket ) ){
+				   throw( message = 'getStorageForPath: path is relative but no Bucket provided and no S3_BUCKET env var.' );
+			   }
+			   cloud.bucketName = listFirst( envBucket, '/' );
+			   var bucketPrefix = '';
+			   if( listLen( envBucket, '/' ) > 1 ){
+				   bucketPrefix = listRest( envBucket, '/' ) & '/';
+			   }
+			   var envPath = '';
+			   try {
+				   envPath = getSystemSetting( "S3_PATH", "" );
+			   } catch( any ignore ) {}
+			   if( len( envPath ) ){
+				   if( right( envPath, 1 ) != '/' ) envPath &= '/';
+				   bucketPrefix &= envPath;
+			   }
+			   var normalizedSource = arguments.path;
+			   if( left( normalizedSource,1 ) == '/' ){
+				   normalizedSource = mid( normalizedSource, 2, len( normalizedSource ) );
+			   }
+			   cloud.objectKey = bucketPrefix & normalizedSource;
+			   return cloud;
+		   }
+		   if( len( arguments.bucket ) > 4096 ){
+			   throw( message = 'getStorageForPath: Bucket setting too large (' & len( arguments.bucket ) & ').' );
+		   }
+		   // Set Bucket
+		   cloud.bucketName = listFirst( arguments.bucket, '/' );
+		   var bucketPrefix = '';
+		   if( listLen( arguments.bucket, '/' ) > 1 ){
+			   bucketPrefix = listRest( arguments.bucket, '/' ) & '/';
+		   }
+		   var normalizedSource = arguments.path;
+		   if( left( normalizedSource,1 ) == '/' ){
+			   normalizedSource = mid( normalizedSource, 2, len( normalizedSource ) );
+		   }
+		   // Set ObjectKey
+		   cloud.objectKey = bucketPrefix & normalizedSource;
+		   // Return cloud object
+		   return cloud;
+	}
+}

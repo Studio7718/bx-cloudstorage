@@ -1,0 +1,704 @@
+/**
+ * S3JavaSDKStrategy - Implements ICloudStorageStrategy using AWS SDK for Java v2 with dynamic class loading
+ */
+class implements="bxModules.bxcloudstorage.models.vendor.ICloudStorageStrategy" {
+	property s3Client;
+	property s3AsyncClient;
+	property credentialsProvider;
+	property regionObj;
+
+	function init() {
+		try {
+			// Get AWS config from environment variables
+			var awsKey = getSystemSetting( "S3_ACCESS_KEY", "" );
+			var awsSecretKey = getSystemSetting( "S3_SECRET_KEY", "" );
+			var defaultRegion = getSystemSetting( "S3_REGION", "us-east-1" );
+
+			if( !len( awsKey ) || !len( awsSecretKey ) ){
+				throw( message="AWS credentials not configured. Set S3_ACCESS_KEY and S3_SECRET_KEY environment variables." );
+			}
+
+			// Java class references
+			var Region = createObject( "java", "software.amazon.awssdk.regions.Region" );
+			var s3c = createObject( "java", "software.amazon.awssdk.services.s3.S3Client" );
+			var s3ac = createObject( "java", "software.amazon.awssdk.services.s3.S3AsyncClient" );
+			var AwsBasicCredentials = createObject( "java", "software.amazon.awssdk.auth.credentials.AwsBasicCredentials" );
+			var StaticCredentialsProvider = createObject( "java", "software.amazon.awssdk.auth.credentials.StaticCredentialsProvider" );
+
+			// Create credentials
+			var credentials = AwsBasicCredentials.create( awsKey, awsSecretKey );
+			variables.credentialsProvider = StaticCredentialsProvider.create( credentials );
+			variables.regionObj = Region.of( lcase( defaultRegion ) );
+
+			// HTTP client tuning via env vars to avoid connection pool exhaustion
+			var maxConnections = 64;
+			var envMaxConns = getSystemSetting( "S3_MAX_CONNECTIONS", "" );
+			if( len( envMaxConns ) && isNumeric( envMaxConns ) && toNumeric( envMaxConns ) > 0 ) {
+				maxConnections = toNumeric( envMaxConns );
+			}
+			var connTimeoutSeconds = 10;
+			var envConnTimeout = getSystemSetting( "S3_CONN_TIMEOUT_SECONDS", "" );
+			if( len( envConnTimeout ) && isNumeric( envConnTimeout ) && toNumeric( envConnTimeout ) >= 0 ) {
+				connTimeoutSeconds = toNumeric( envConnTimeout );
+			}
+			var socketTimeoutSeconds = 60;
+			var envSocketTimeout = getSystemSetting( "S3_SOCKET_TIMEOUT_SECONDS", "" );
+			if( len( envSocketTimeout ) && isNumeric( envSocketTimeout ) && toNumeric( envSocketTimeout ) >= 0 ) {
+				socketTimeoutSeconds = toNumeric( envSocketTimeout );
+			}
+			var maxIdleSeconds = 60;
+			var envMaxIdle = getSystemSetting( "S3_CONN_MAX_IDLE_SECONDS", "" );
+			if( len( envMaxIdle ) && isNumeric( envMaxIdle ) && toNumeric( envMaxIdle ) >= 0 ) {
+				maxIdleSeconds = toNumeric( envMaxIdle );
+			}
+
+			var ApacheHttpClient = createObject( "java", "software.amazon.awssdk.http.apache.ApacheHttpClient" );
+			var Duration = createObject( "java", "java.time.Duration" );
+			var httpClientBuilder = ApacheHttpClient.builder()
+				.maxConnections( maxConnections )
+				.connectionTimeout( Duration.ofSeconds( connTimeoutSeconds ) )
+				.socketTimeout( Duration.ofSeconds( socketTimeoutSeconds ) )
+				.connectionMaxIdleTime( Duration.ofSeconds( maxIdleSeconds ) );
+
+			// Create S3Client (sync) with tuned HTTP client
+			variables.s3Client = s3c.builder()
+				.region( variables.regionObj )
+				.credentialsProvider( variables.credentialsProvider )
+				.httpClientBuilder( httpClientBuilder )
+				.build();
+
+			// Create S3AsyncClient (for TransferManager) with tuned Netty client
+			var NettyNioAsyncHttpClient = createObject( "java", "software.amazon.awssdk.http.nio.netty.NettyNioAsyncHttpClient" );
+			var asyncHttpClientBuilder = NettyNioAsyncHttpClient.builder()
+				.maxConcurrency( maxConnections )
+				.readTimeout( Duration.ofSeconds( socketTimeoutSeconds ) )
+				.connectionTimeout( Duration.ofSeconds( connTimeoutSeconds ) );
+
+			variables.s3AsyncClient = s3ac.builder()
+				.region( variables.regionObj )
+				.credentialsProvider( variables.credentialsProvider )
+				.httpClientBuilder( asyncHttpClientBuilder )
+				.build();
+		} catch( any e ){
+			throw( message="Failed to initialize S3Client/S3AsyncClient: " & e.message );
+		}
+		return this;
+	}
+
+	/**
+	 * Generate presigned URL using AWS SDK v2 S3Presigner
+	 */
+	public struct function generatePresignedURL(
+		required string bucketName,
+		required string objectKey,
+		numeric expiresSeconds = 900,
+		string method = "GET",
+		string contentType = "",
+		struct metadata = {},
+		struct responseHeaders = {}
+	){
+		try {
+			// Build a presigner using the initialized region and credentials provider
+			var S3Presigner = createObject( "java", "software.amazon.awssdk.services.s3.presigner.S3Presigner" );
+			var presigner = S3Presigner.builder()
+				.region( variables.regionObj )
+				.credentialsProvider( variables.credentialsProvider )
+				.build();
+
+			var Duration = createObject( "java", "java.time.Duration" );
+			var sigDuration = Duration.ofSeconds( arguments.expiresSeconds );
+
+			var methodUpper = ucase( arguments.method );
+			if( methodUpper == "GET" ){
+				var GetObjectRequest = createObject( "java", "software.amazon.awssdk.services.s3.model.GetObjectRequest" );
+				var GetObjectPresignRequest = createObject( "java", "software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest" );
+				var getReqBuilder = GetObjectRequest.builder().bucket( arguments.bucketName ).key( arguments.objectKey );
+				// Optional response headers (Content-Disposition etc.)
+				if( structCount( arguments.responseHeaders ) ){
+					// Map known headers
+					if( structKeyExists( arguments.responseHeaders, "response-content-type" ) ) getReqBuilder = getReqBuilder.responseContentType( arguments.responseHeaders["response-content-type"] );
+					if( structKeyExists( arguments.responseHeaders, "response-content-disposition" ) ) getReqBuilder = getReqBuilder.responseContentDisposition( arguments.responseHeaders["response-content-disposition"] );
+					if( structKeyExists( arguments.responseHeaders, "response-content-language" ) ) getReqBuilder = getReqBuilder.responseContentLanguage( arguments.responseHeaders["response-content-language"] );
+				}
+				var getReq = getReqBuilder.build();
+				var presignReq = GetObjectPresignRequest.builder()
+					.signatureDuration( sigDuration )
+					.getObjectRequest( getReq )
+					.build();
+				var presigned = presigner.presignGetObject( presignReq );
+				var psurl = presigned.url().toString();
+				presigner.close();
+				return { "url": psurl, "method": "GET", "expires": arguments.expiresSeconds, "headers": {} };
+			} else if( methodUpper == "PUT" ){
+				var PutObjectRequest = createObject( "java", "software.amazon.awssdk.services.s3.model.PutObjectRequest" );
+				var PutObjectPresignRequest = createObject( "java", "software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest" );
+				var putReqBuilder = PutObjectRequest.builder().bucket( arguments.bucketName ).key( arguments.objectKey );
+				if( len( arguments.contentType ) ) putReqBuilder = putReqBuilder.contentType( arguments.contentType );
+				if( structCount( arguments.metadata ) ){
+					// Convert BoxLang struct to Java Map
+					var HashMap = createObject( "java", "java.util.HashMap" );
+					var metaMap = HashMap.init();
+					for( var k in arguments.metadata ){
+						metaMap.put( k, toString( arguments.metadata[ k ] ) );
+					}
+					putReqBuilder = putReqBuilder.metadata( metaMap );
+				}
+				var putReq = putReqBuilder.build();
+				var presignReq = PutObjectPresignRequest.builder()
+					.signatureDuration( sigDuration )
+					.putObjectRequest( putReq )
+					.build();
+				var presigned = presigner.presignPutObject( presignReq );
+				var psurl = presigned.url().toString();
+				// Collect signed headers required for the client
+				var headersMap = {};
+				var signed = presigned.signedHeaders();
+				var entrySet = signed.entrySet();
+				var iterator = entrySet.iterator();
+				while( iterator.hasNext() ){
+					var entry = iterator.next();
+					headersMap[ entry.getKey() ] = entry.getValue();
+				}
+				presigner.close();
+				return { "url": psurl, "method": "PUT", "expires": arguments.expiresSeconds, "headers": headersMap };
+			} else {
+				presigner.close();
+				throw( message = "Unsupported method for presign: " & method );
+			}
+		} catch( any e ){
+			return { "url": "", "method": method, "expires": arguments.expiresSeconds, "headers": {}, "error": true, "message": "S3JavaSDKStrategy.generatePresignedURL failed: " & e.message };
+		}
+	}
+	/**
+	 *  List objects in a bucket using AWS SDK for Java v2
+	 */
+	public any function listObjects( required string bucketName, string prefix = "", string delimiter = "", string continuationToken = "" ) {
+		try {
+			var req = createObject( "java", "software.amazon.awssdk.services.s3.model.ListObjectsV2Request" );
+
+			// Build ListObjectsV2Request using exact Java pattern
+			var requestBuilder = req.builder()
+				.bucket( arguments.bucketName )
+				.prefix( arguments.prefix );
+
+			if( len( arguments.prefix ) ) requestBuilder = requestBuilder.prefix( arguments.prefix );
+			if( len( arguments.delimiter ) ) requestBuilder = requestBuilder.delimiter( arguments.delimiter );
+			if( len( arguments.continuationToken ) ) requestBuilder = requestBuilder.continuationToken( arguments.continuationToken );
+			var listRequest = requestBuilder.build();
+
+			// Execute the request following Java pattern
+			var response = variables.s3Client.listObjectsV2( listRequest );
+
+			// Convert response to BoxLang format
+			var contents = [];
+			var objectList = response.contents();
+
+			// Iterate through the objects
+			for( var i = 0; i < objectList.size(); i++ ){
+				var s3Object = objectList.get( i );
+				arrayAppend( contents, {
+					Key: s3Object.key(),
+					Size: s3Object.size(),
+					LastModified: s3Object.lastModified().toString()
+				});
+			}
+
+			var prefixes = [];
+			var commonPrefixList = response.commonPrefixes();
+			if( !isNull( commonPrefixList ) ){
+				for( var j = 0; j < commonPrefixList.size(); j++ ){
+					var commonPrefix = commonPrefixList.get( j );
+					arrayAppend( prefixes, { Prefix: commonPrefix.prefix() } );
+				}
+			}
+
+			return {
+				Contents: contents,
+				CommonPrefixes: prefixes,
+				IsTruncated: response.isTruncated(),
+				NextContinuationToken: response.nextContinuationToken() ?: ""
+			};
+		} catch( any e ){
+			throw( message="S3JavaSDKStrategy.listObjects failed: " & e.message );
+		}
+	}
+
+	/**
+	 * Async multipart upload for large files using AWS SDK for Java v2
+	 * @bucketName S3 bucket
+	 * @objectKey S3 key
+	 * @localPath Local file path
+	 * @partSize Size of each part in bytes
+	 * @maxConcurrent Max concurrent uploads
+	 * @timeoutSeconds Timeout in seconds
+	 * @return struct { error:boolean, message:string, eTag:string, parts:numeric }
+	 */
+	public struct function multipartUploadAsync(
+		required string bucketName,
+		required string objectKey,
+		required string localPath,
+		required numeric partSize,
+		required numeric maxConcurrent,
+		required numeric timeoutSeconds
+	){
+		try {
+			// Use AWS TransferManager for robust multipart upload (must use S3AsyncClient)
+			var S3TransferManager = createObject( "java", "software.amazon.awssdk.transfer.s3.S3TransferManager" );
+			var transferManager = S3TransferManager.builder()
+				.s3Client( variables.s3AsyncClient )
+				.build();
+			var UploadFileRequest = createObject( "java", "software.amazon.awssdk.transfer.s3.model.UploadFileRequest" );
+			var Paths = createObject( "java", "java.nio.file.Paths" );
+			var uploadRequest = UploadFileRequest.builder()
+				.putObjectRequest(
+					createObject( "java", "software.amazon.awssdk.services.s3.model.PutObjectRequest" )
+						.builder().bucket( arguments.bucketName ).key( arguments.objectKey ).build()
+				)
+				.source(Paths.get( arguments.localPath ))
+				.build();
+
+			var upload = transferManager.uploadFile( uploadRequest );
+			// Wait for completion (with timeout)
+			var completed = upload.completionFuture().get( arguments.timeoutSeconds, createObject( "java", "java.util.concurrent.TimeUnit" ).SECONDS );
+			var etag = completed.response().eTag() ?: "";
+			transferManager.close();
+			return { error: false, message: "Multipart upload complete", eTag: etag, parts: 0 };
+		} catch( any e ){
+			return { error: true, message: "S3JavaSDKStrategy.multipartUploadAsync failed: " & e.message };
+		}
+	}
+	/**
+	 * Check if a directory exists in S3 using AWS SDK for Java v2
+	 * @bucketName S3 bucket
+	 * @objectKey S3 key (treat as directory if ends with "/")
+	 * @return boolean true if directory exists, false if not
+	 */
+	public boolean function pathExists( required string bucketName, required string objectKey ) {
+		try {
+			// Follow AWS SDK v2 pattern for head object and list operations
+			var HeadObjectRequest = createObject( "java", "software.amazon.awssdk.services.s3.model.HeadObjectRequest" );
+			var ListObjectsV2Request = createObject( "java", "software.amazon.awssdk.services.s3.model.ListObjectsV2Request" );
+
+			// Strategy 1: Check if a placeholder object exists with the exact key
+			try {
+				var headRequest = HeadObjectRequest.builder()
+					.bucket( arguments.bucketName )
+					.key( arguments.objectKey )
+					.build();
+
+				var headResponse = variables.s3Client.headObject( headRequest );
+				// If no exception, the object exists
+				return true;
+			} catch( any ignore ){
+				// Object doesn't exist, continue to next strategy
+			}
+
+			// Strategy 2: List objects with the prefix to see if any exist
+			var listRequest = ListObjectsV2Request.builder()
+				.bucket( arguments.bucketName )
+				.prefix( arguments.objectKey )
+				.maxKeys( 1 )
+				.build();
+
+			var listResponse = variables.s3Client.listObjectsV2( listRequest );
+			var objectList = listResponse.contents();
+
+			// If any objects exist with this prefix, directory exists
+			return !isNull( objectList ) && objectList.size() > 0;
+
+		} catch( any e ){
+			throw( message="S3JavaSDKStrategy.directoryExists failed: " & e.message );
+		}
+	}
+
+	/**
+	 * Delete an object from S3 using AWS SDK for Java v2
+	 * @bucketName S3 bucket
+	 * @objectKey S3 key
+	 * @return struct { success:boolean, message:string, data:struct }
+	 */
+	public struct function deleteObject( required string bucketName, required string objectKey ) {
+		try {
+			// Follow AWS SDK v2 pattern for delete operations
+			var DeleteObjectRequest = createObject( "java", "software.amazon.awssdk.services.s3.model.DeleteObjectRequest" );
+
+			var deleteRequest = DeleteObjectRequest.builder()
+				.bucket( arguments.bucketName )
+				.key( arguments.objectKey )
+				.build();
+
+			var response = variables.s3Client.deleteObject( deleteRequest );
+
+			return {
+				success = true,
+				message = "Object deleted successfully",
+				data = {
+					deleteMarker = response.deleteMarker() ?: false,
+					versionId = response.versionId() ?: ""
+				}
+			};
+		} catch( any e ){
+			throw( message="S3JavaSDKStrategy.deleteObject failed: " & e.message );
+		}
+	}
+
+	/**
+	 * Create a directory placeholder in S3 using AWS SDK for Java v2
+	 * @bucketName S3 bucket
+	 * @objectKey S3 key (treat as directory if ends with "/")
+	 * @return struct { success:boolean, message:string, directory:string, existed:boolean, created:boolean, data:struct }
+	 */
+	public struct function createDirectory( required string bucketName, required string objectKey ) {
+		try {
+			// First check if directory already exists
+			if( pathExists( arguments.bucketName, arguments.objectKey ) ){
+				return { success = true, message = 'exists', directory = arguments.objectKey, existed=true, created=false };
+			}
+
+			// Create zero-byte placeholder object using AWS SDK v2
+			var PutObjectRequest = createObject( "java", "software.amazon.awssdk.services.s3.model.PutObjectRequest" );
+			var RequestBody = createObject( "java", "software.amazon.awssdk.core.sync.RequestBody" );
+
+			var putRequest = PutObjectRequest.builder()
+				.bucket( arguments.bucketName )
+				.key( arguments.objectKey )
+				.build();
+
+			// Create empty content
+			var emptyContent = RequestBody.empty();
+
+			var response = variables.s3Client.putObject( putRequest, emptyContent );
+
+			return {
+				success = true,
+				message = "Directory created successfully",
+				directory = arguments.objectKey,
+				existed = false,
+				created = true,
+				data = {
+					eTag = response.eTag() ?: "",
+					versionId = response.versionId() ?: ""
+				}
+			};
+		} catch( any e ){
+		    throw( message="S3JavaSDKStrategy.createDirectory failed: " & e.message );
+		}
+	}
+
+	/**
+	 * Upload a file to S3 using AWS SDK for Java v2
+	 * @bucketName S3 bucket
+	 * @objectKey S3 key
+	 * @fileContent Binary file content
+	 * @contentType Optional content type
+	 * @return struct { success:boolean, message:string, data:struct }
+	 */
+	public struct function putObject( required string bucketName, required string objectKey, required binary fileContent, string contentType = "" ) {
+		try {
+			// Follow AWS SDK v2 pattern for put operations
+			var PutObjectRequest = createObject( "java", "software.amazon.awssdk.services.s3.model.PutObjectRequest" );
+			var RequestBody = createObject( "java", "software.amazon.awssdk.core.sync.RequestBody" );
+
+			var putRequestBuilder = PutObjectRequest.builder()
+				.bucket( arguments.bucketName )
+				.key( arguments.objectKey );
+
+			// Add content type if provided
+			if( len( arguments.contentType ) ){
+				putRequestBuilder = putRequestBuilder.contentType( arguments.contentType );
+			}
+
+			var putRequest = putRequestBuilder.build();
+
+			// Create request body from binary content
+			var requestBody = RequestBody.fromBytes( arguments.fileContent );
+
+			var response = variables.s3Client.putObject( putRequest, requestBody );
+
+			return {
+				success = true,
+				message = "Object uploaded successfully",
+				data = {
+					eTag = response.eTag() ?: "",
+					versionId = response.versionId() ?: ""
+				}
+			};
+		} catch( any e ){
+			throw( message="S3JavaSDKStrategy.putObject failed: " & e.message );
+		}
+	}
+
+	/**
+	 * Download an object from S3 using AWS SDK for Java v2
+	 * @bucketName S3 bucket
+	 * @objectKey S3 key
+	 * @return binary file content
+	 */
+	public any function getObject( required string bucketName, required string objectKey ){
+		try {
+			// Follow AWS SDK v2 pattern for get operations
+			var GetObjectRequest = createObject( "java", "software.amazon.awssdk.services.s3.model.GetObjectRequest" );
+
+			var getRequest = GetObjectRequest.builder()
+				.bucket( arguments.bucketName )
+				.key( arguments.objectKey )
+				.build();
+
+			var response = variables.s3Client.getObject( getRequest );
+
+			// Stream into a ByteArrayOutputStream to avoid readAllBytes()
+			var ByteArrayOutputStream = createObject( "java", "java.io.ByteArrayOutputStream" );
+			var baos = ByteArrayOutputStream.init();
+			var ByteBuffer = createObject( "java", "java.nio.ByteBuffer" );
+			var buf = ByteBuffer.allocate( 64 * 1024 );
+			var arr = buf.array();
+			while( true ){
+				var read = response.read( arr );
+				if( read == -1 ) break;
+				baos.write( arr, 0, read );
+			}
+			try { response.close(); } catch( any ignore ){}
+
+			return baos.toByteArray();
+		} catch( any e ){
+			throw( message="S3JavaSDKStrategy.getObject failed: " & e.message );
+		}
+	}
+
+	/**
+	 * Download a byte range from an S3 object using AWS SDK for Java v2
+	 * @bucketName S3 bucket
+	 * @objectKey S3 key
+	 * @startByte Starting byte position (inclusive)
+	 * @endByte Ending byte position (inclusive)
+	 * @return binary content of the specified byte range
+	 */
+	public any function getObjectRange(
+		required string bucketName,
+		required string objectKey,
+		required numeric startByte,
+		required numeric endByte
+	){
+		try {
+			var GetObjectRequest = createObject( "java", "software.amazon.awssdk.services.s3.model.GetObjectRequest" );
+			var rangeHeader = "bytes=" & arguments.startByte & "-" & arguments.endByte;
+			var getRequest = GetObjectRequest.builder()
+				.bucket( arguments.bucketName )
+				.key( arguments.objectKey )
+				.range( rangeHeader )
+				.build();
+
+			var response = variables.s3Client.getObject( getRequest );
+			// Stream into a ByteArrayOutputStream to avoid readAllBytes()
+			var ByteArrayOutputStream = createObject( "java", "java.io.ByteArrayOutputStream" );
+			var baos = ByteArrayOutputStream.init();
+			var ByteBuffer = createObject( "java", "java.nio.ByteBuffer" );
+			var buf = ByteBuffer.allocate( 64 * 1024 );
+			var arr = buf.array();
+			while( true ){
+				var read = response.read( arr );
+				if( read == -1 ) break;
+				baos.write( arr, 0, read );
+			}
+			try { response.close(); } catch( any ignore ){}
+			return baos.toByteArray();
+		} catch( any e ){
+			throw( message="S3JavaSDKStrategy.getObjectRange failed: " & e.message );
+		}
+	}
+
+	/**
+	 * Stream a byte range from an S3 object (caller must close the stream)
+	 * @bucketName S3 bucket
+	 * @objectKey S3 key
+	 * @startByte Starting byte position (inclusive)
+	 * @endByte Ending byte position (inclusive)
+	 * @return ResponseInputStream from AWS SDK v2 which caller can read in chunks and must close after use
+	 * Note: Caller is responsible for closing the stream to avoid resource leaks
+	 */
+	public any function getObjectRangeStream(
+		required string bucketName,
+		required string objectKey,
+		required numeric startByte,
+		required numeric endByte
+	){
+		try {
+			var GetObjectRequest = createObject( "java", "software.amazon.awssdk.services.s3.model.GetObjectRequest" );
+			var rangeHeader = "bytes=" & arguments.startByte & "-" & arguments.endByte;
+			var getRequest = GetObjectRequest.builder()
+				.bucket( arguments.bucketName )
+				.key( arguments.objectKey )
+				.range( rangeHeader )
+				.build();
+
+			// Return the ResponseInputStream so caller can stream to disk in small buffers
+			var response = variables.s3Client.getObject( getRequest );
+			return response;
+		} catch( any e ){
+			throw( message="S3JavaSDKStrategy.getObjectRangeStream failed: " & e.message );
+		}
+	}
+
+	/**
+	 * Get object metadata from S3 using AWS SDK for Java v2
+	 * @bucketName S3 bucket
+	 * @objectKey S3 key
+	 * @return struct with metadata fields or not-found indication
+	 * Note: If the object does not exist, this method will check if the key can be treated as a directory prefix and return aggregate metadata for the prefix if found, otherwise it will return a not-found response. This provides more intuitive behavior for directory-like keys in S3.
+	 */
+	public struct function getObjectMetadata( required string bucketName, required string objectKey ) {
+		try {
+			// Follow AWS SDK v2 pattern for head operations
+			var HeadObjectRequest = createObject( "java", "software.amazon.awssdk.services.s3.model.HeadObjectRequest" );
+
+			var headRequest = HeadObjectRequest.builder()
+				.bucket( arguments.bucketName )
+				.key( arguments.objectKey )
+				.build();
+
+			var response = variables.s3Client.headObject( headRequest );
+
+			// Handle Java types properly - avoid ternary with non-boolean Java objects
+			var lastModifiedStr = "";
+			var lastModified = response.lastModified();
+			if( !isNull( lastModified ) ){
+				lastModifiedStr = lastModified.toString();
+			}
+
+			return {
+				isDirectory = false,
+				success = true,
+				bucketName = arguments.bucketName,
+				prefix = arguments.objectKey,
+				size = response.contentLength() ?: 0,
+				contentType = response.contentType() ?: "",
+				lastModified = lastModifiedStr,
+				eTag = response.eTag() ?: "",
+				versionId = response.versionId() ?: "",
+			};
+		} catch( any e ){
+			// Provide clearer 404 handling and directory prefix metadata when object key is not a real object
+			var statusCode = 0;
+			try { statusCode = e.statusCode(); } catch( any ignore ){
+				// Fall back to parsing message when Java exception does not expose statusCode()
+				var msg = e.message ?: "";
+				if( reFindNoCase( "Status Code\s*:\s*404", msg ) ) statusCode = 404;
+			}
+			if( statusCode == 404 ){
+				// Treat objectKey as a directory prefix; ensure trailing slash
+				var prefixKey = arguments.objectKey;
+				if( len( prefixKey ) && right( prefixKey, 1 ) != "/" ) prefixKey &= "/";
+				try {
+					// List all objects under the prefix and derive aggregate metadata
+					var ListObjectsV2Request = createObject( "java", "software.amazon.awssdk.services.s3.model.ListObjectsV2Request" );
+					var totalSize = 0;
+					var objectCount = 0;
+					var latestInstant = javacast( "null", 0 );
+					var continuationToken = "";
+
+					while( true ){
+						var builder = ListObjectsV2Request.builder()
+							.bucket( arguments.bucketName )
+							.prefix( prefixKey );
+						if( len( continuationToken ) ) builder = builder.continuationToken( continuationToken );
+						var listRequest = builder.build();
+						var response = variables.s3Client.listObjectsV2( listRequest );
+						var objectList = response.contents();
+						if( !isNull( objectList ) ){
+							for( var i = 0; i < objectList.size(); i++ ){
+								var s3Object = objectList.get( i );
+								// Skip folder markers
+								var keyVal = s3Object.key();
+								if( !isNull( keyVal ) && right( toString( keyVal ), 1 ) == "/" ) continue;
+								totalSize += ( s3Object.size() ?: 0 );
+								objectCount++;
+								var lm = s3Object.lastModified();
+								if( !isNull( lm ) ){
+									try {
+										if( isNull( latestInstant ) ){
+											latestInstant = lm;
+										} else if( lm.compareTo( latestInstant ) > 0 ){
+											latestInstant = lm;
+										}
+									} catch( any ignore ){}
+								}
+							}
+						}
+						if( response.isTruncated() ){
+							continuationToken = response.nextContinuationToken() ?: "";
+							if( !len( continuationToken ) ) break;
+						} else {
+							break;
+						}
+					}
+
+					if( objectCount > 0 ){
+						var latestStr = "";
+						try { if( !isNull( latestInstant ) ) latestStr = latestInstant.toString(); } catch( any ignore ){}
+						return {
+							success       : true,
+							isDirectory   : true,
+							bucketName    : arguments.bucketName,
+							prefix        : prefixKey,
+							objectCount   : objectCount,
+							totalSize     : totalSize,
+							lastModifiedLatest : latestStr
+						};
+					}
+					// No objects under prefix; return not-found semantics
+					return {
+						success    : false,
+						notFound   : true,
+						statusCode : 404,
+						message    : "Object or prefix not found",
+						bucketName : arguments.bucketName,
+						objectKey  : arguments.objectKey
+					};
+				} catch( any le ){
+					// If listing fails, propagate original error text
+					throw( message = "S3JavaSDKStrategy.getObjectMetadata failed (listing prefix): " & le.message );
+				}
+			}
+			// Non-404 errors rethrow
+			throw( message = "S3JavaSDKStrategy.getObjectMetadata failed: " & e.message );
+		}
+	}
+
+	/**
+	 * Server-side copy of an object in S3 using AWS SDK for Java v2
+	 * @sourceBucket Source S3 bucket
+	 * @sourceKey Source S3 key
+	 * @destinationBucket Destination S3 bucket
+	 * @destinationKey Destination S3 key
+	 * @return struct { success:boolean, message:string, eTag:string, versionId:string }
+	 * Note: This method performs a server-side copy within S3 which is more efficient than downloading and re-uploading the object, especially for large files. It uses the CopyObject API of AWS SDK for Java v2 to copy the object directly on the server side. The response includes the ETag and version ID of the copied object if the operation is successful. If the copy fails, it returns a structured error message without throwing an exception, allowing the caller to handle the failure gracefully.
+	 */
+	public struct function copyObject(
+		required string sourceBucket,
+		required string sourceKey,
+		required string destinationBucket,
+		required string destinationKey
+	){
+		try {
+			var CopyObjectRequest = createObject( "java", "software.amazon.awssdk.services.s3.model.CopyObjectRequest" );
+			var copyRequest = CopyObjectRequest.builder()
+				.sourceBucket( arguments.sourceBucket )
+				.sourceKey( arguments.sourceKey )
+				.destinationBucket( arguments.destinationBucket )
+				.destinationKey( arguments.destinationKey )
+				.build();
+			var response = variables.s3Client.copyObject( copyRequest );
+			return {
+				success = true,
+				message = "Copy successful",
+				eTag = response.copyObjectResult().eTag() ?: "",
+				versionId = response.versionId() ?: ""
+			};
+		} catch( any e ){
+			return {
+				success = false,
+				message = "S3JavaSDKStrategy.copyObject failed: " & e.message
+			};
+		}
+	}
+}

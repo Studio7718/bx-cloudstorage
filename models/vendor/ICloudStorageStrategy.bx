@@ -1,0 +1,108 @@
+/**
+ * Cloud Storage Strategy Interface
+ * Defines the contract for vendor implementations (e.g., AWS S3).
+ */
+interface ICloudStorageStrategy {
+
+	/**
+	 * Server-side copy of an object in S3
+	 * @sourceBucket string
+	 * @sourceKey string
+	 * @destinationBucket string
+	 * @destinationKey string
+	 * @return struct
+	 */
+	public struct function copyObject( required string sourceBucket, required string sourceKey, required string destinationBucket, required string destinationKey );
+
+	/**
+	 * Create a directory placeholder in S3
+	 * @bucketName string
+	 * @objectKey string (should end with /)
+	 * @return struct
+	 */
+	public struct function createDirectory( required string bucketName, required string objectKey );
+
+	/**
+	 * Delete an object from S3
+	 * @bucketName string
+	 * @objectKey string
+	 * @return struct
+	 */
+	public struct function deleteObject( required string bucketName, required string objectKey );
+
+	/**
+	 * Download an object (small files - single operation)
+	 * @bucketName string
+	 * @objectKey string
+	 * @return binary content or struct with error
+	 */
+	public any function getObject( required string bucketName, required string objectKey );
+
+	/**
+	 * Get object metadata (size, content type, etc.)
+	 * @bucketName string
+	 * @objectKey string
+	 * @return struct
+	 */
+	public struct function getObjectMetadata( required string bucketName, required string objectKey );
+
+	/**
+	 * Download a byte range from an object
+	 * @bucketName string
+	 * @objectKey string
+	 * @startByte numeric
+	 * @endByte numeric
+	 */
+	public any function getObjectRange(
+        required string bucketName,
+        required string objectKey,
+        required numeric startByte,
+        required numeric endByte
+    );
+	/**
+	 * List objects (V2)
+	 * @bucketName string
+	 * @prefix string
+	 * @delimiter string
+	 * @continuationToken string
+	 * @return struct { Contents: array, CommonPrefixes: array, IsTruncated: boolean, NextContinuationToken: string }
+	 */
+	public any function listObjects( required string bucketName, string prefix = "", string delimiter = "", string continuationToken = "" );
+
+	/**
+	 * Check if a path/prefix exists
+	 * @bucketName string
+	 * @objectKey string (should end with /)
+	 */
+	public boolean function pathExists( required string bucketName, required string objectKey );
+
+	/**
+	 * Upload a small object
+	 * @bucketName string
+	 * @objectKey string
+	 * @fileContent binary
+	 * @contentType string
+	 */
+	public struct function putObject( required string bucketName, required string objectKey, required binary fileContent, string contentType = "" );
+
+	/**
+	 * Generate a presigned URL for an object
+	 * @bucketName string
+	 * @objectKey string
+	 * @expiresSeconds numeric expiration in seconds (default 900)
+	 * @method string HTTP method: GET or PUT (default GET)
+	 * @contentType string Optional content type to bind to signature (PUT)
+	 * @metadata struct Optional metadata map for PUT; keys will be sent as x-amz-meta-*
+	 * @responseHeaders struct Optional response headers for GET (e.g., content-disposition)
+	 * @return struct { url:string, method:string, expires:numeric, headers:struct }
+	 */
+	public struct function generatePresignedURL(
+		required string bucketName,
+		required string objectKey,
+		numeric expiresSeconds = 900,
+		string method = "GET",
+		string contentType = "",
+		struct metadata = {},
+		struct responseHeaders = {}
+	);
+}

@@ -1,0 +1,64 @@
+/**
+ * This is a BOXLANG BIF.  Please note that all BIFs are registered
+ * as singletons.
+ *
+ * Annotations you can use on a BIF:
+ * <pre>
+ * // The alias of the BIF, defaults to the name of the Class
+ * @BoxBIF - The BIF is registered as the name of the class
+ * @BoxBIF( 'myBifAlias' ) - Register with the specific name
+ * @BoxBIF( [ 'myBifAlias', 'myOtherBifAlias' ] ) - Register with all these names
+ * @BoxMember( 'string' ) : Register also as a member method on strings.
+ * @BoxMember( { 'string' : { name : '', objectArgument : '' }, 'array' : { name : '', objectArgument : '' } } ) - Register on multiple types
+ * </pre>
+ *
+ */
+import bxModules.bxcloudstorage.models.CloudStorageService;
+
+@BoxBIF
+class {
+
+	/**
+	 * Return a presigned URL for a cloud file (S3).
+	 *
+	 * @file Cloud path like `s3:///bucket/key` or relative key (resolved by CloudStorageService).
+	 * @method HTTP method: `GET` or `PUT` (default `GET`).
+	 * @expiresSeconds Expiration time in seconds (default 900).
+	 * @contentType Optional content type bound to the signature (primarily for `PUT`).
+	 * @metadata Optional struct of metadata to include for `PUT` (sent as `x-amz-meta-*`).
+	 * @responseHeaders Optional struct of response headers for `GET` (e.g., `Content-Disposition`, `Content-Type`).
+	 * @return Struct `{ url:string, method:string, expires:numeric, headers?:struct }`.
+	 */
+	any function invoke(
+		required string file,
+		string method = "GET",
+		numeric expiresSeconds = 900,
+		string contentType = "",
+		struct metadata = {},
+		struct responseHeaders = {}
+	){
+		try {
+			var service = new CloudStorageService();
+			var resolved = service.getStorageForPath( arguments.file );
+
+			if( !structKeyExists( resolved, "storage" ) || isNull( resolved.storage ) ){
+				throw( message = "File must be a cloud path (e.g., s3:///bucket/key)." );
+			}
+
+			var result = resolved.storage.generatePresignedUrl(
+				resolved.bucketName,
+				resolved.objectKey,
+				expiresSeconds,
+				method,
+				contentType,
+				metadata,
+				responseHeaders
+			);
+
+			return result;
+		} catch( any e ){
+			return { "url": "", "error": true, "message": e.message };
+		}
+	}
+
+}

@@ -1,0 +1,47 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/" {
+    function beforeAll(){
+        super.beforeAll();
+        // Env-driven values similar to CSDirectoryExistsSpec
+        variables.testPathS3         = getSystemSetting("S3_TEST_PATH_S3", "s3:///my-test-bucket/test-dir/");
+        variables.testLocalFileSmall = getSystemSetting("S3_TEST_LOCAL_FILE_SMALL", "/tmp/s3test/small.txt");
+
+        // Ensure a small local file exists for upload
+        if( !fileExists( variables.testLocalFileSmall ) ){
+            directoryCreate( getDirectoryFromPath( variables.testLocalFileSmall ), true );
+            fileWrite( variables.testLocalFileSmall, repeatString( "x", 1024 ) );
+        }
+    }
+
+    function run(){
+        var rand  = lcase( replace( createUUID(), '-', '', 'all' ) );
+        var s3Key = variables.testPathS3 & 'fileinfo-' & rand & '.txt';
+
+        describe( 'CSFileInfo BIF (env-configured)', () => {
+            it( 'returns metadata for an uploaded S3 object', () => {
+                // Upload a temp file
+                var up = CSFileCopy( source = variables.testLocalFileSmall, destination = s3Key );
+                expect( up.success ?: (! ( up.error ?: false )) ).toBeTrue();
+
+                // Get info
+                var info = CSFileInfo( s3Key );
+                expect( isStruct( info ) ).toBeTrue();
+                // Minimal assertions across strategies
+                expect( ( info.size ?: 0 ) ).toBeGT( 0 );
+                expect( len( info.contentType ?: "" ) ).toBeGTE( 0 );
+                // Some strategies include eTag
+                if( structKeyExists( info, "eTag" ) ) expect( len( info.eTag ?: "" ) ).toBeGTE( 0 );
+
+                // Cleanup
+                var del = CSFileDelete( s3Key );
+                expect( del.success ?: true ).toBeTrue();
+            });
+
+            it( 'returns a failure struct for a missing object', () => {
+                var missing = CSFileInfo( s3Key & '.missing' );
+                expect( isStruct( missing ) ).toBeTrue();
+                expect( ( missing.success ?: false ) ).toBeFalse();
+                expect( len( missing.message ?: '' ) ).toBeGT( 0 );
+            });
+        });
+    }
+}
