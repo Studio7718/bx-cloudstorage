@@ -1,0 +1,17 @@
+/**
+ * BOXLANG BIF: Get current transfer status metrics
+ * Returns an array of small JSON-able structs with counts and optional safe details.
+ */
+import bxModules.bxcloudstorage.models.CloudStorageService;
+
+@BoxBIF
+class {
+    /**
+     * @details boolean Include minimal per-transfer details (no bucket or full paths)
+     * @return array of structs
+     */
+    array function invoke( boolean details = false ){
+        var service = new CloudStorageService();
+        return service.getTransferMonitor().snapshot( arguments.details );
+    }
+}

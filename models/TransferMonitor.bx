@@ -1,0 +1,214 @@
+/*
+ * TransferMonitor.bx
+ * A thread-safe singleton class to track active uploads and downloads, their progress, and associated threads.
+ * Provides a snapshot method for monitoring purposes, with optional details of active transfers.
+ */
+class threadSafe singleton {
+    property activeDownloads;
+    property activeUploads;
+    property totalActiveThreads;
+    property executorGroups;
+	// Initialization method to set up concurrent data structures
+    function init(){
+        var ConcurrentHashMap = createObject( "java", "java.util.concurrent.ConcurrentHashMap" );
+        var AtomicInteger = createObject( "java", "java.util.concurrent.atomic.AtomicInteger" );
+        variables.activeDownloads = ConcurrentHashMap.init(); // id -> struct
+        variables.activeUploads   = ConcurrentHashMap.init(); // id -> struct
+        variables.totalActiveThreads = AtomicInteger.init( 0 );
+        variables.executorGroups = ConcurrentHashMap.init(); // groupKey -> { namePrefix, ref }
+        return this;
+    }
+	/**
+	 * Register a new download with optional metadata. Metadata can include method (e.g. "download"), totalChunks, filename, etc.
+	 * The monitor will track the progress and threads associated with this download until it's marked as finished
+	 * @id a unique identifier for the download (e.g. a UUID)
+	 * @meta optional struct with additional info about the download (e.g. method, totalChunks, filename)
+	 */
+    public void function registerDownload( required string id, struct meta = {} ){
+        var AtomicInteger = createObject( "java", "java.util.concurrent.atomic.AtomicInteger" );
+        var rec = {
+            id = arguments.id,
+            status = "running",
+            method = meta.method ?: "download",
+            transferType = "download",
+            totalChunks = meta.totalChunks ?: 0,
+            completedChunks = meta.completedChunks ?: 0,
+            activeThreads = AtomicInteger.init( 0 ),
+            filename = meta.filename ?: "",
+            startedAt = now(),
+            startedTick = getTickCount()
+        };
+        variables.activeDownloads.put( arguments.id, rec );
+    }
+	/**
+	 * Register a new upload with optional metadata. Metadata can include method (e.g. "upload"), totalChunks, filename, etc.
+	 * The monitor will track the progress and threads associated with this upload until it's marked as finished
+	 * @id a unique identifier for the upload (e.g. a UUID)
+	 * @meta optional struct with additional info about the upload (e.g. method, totalChunks, filename)
+	 */
+    public void function registerUpload( required string id, struct meta = {} ){
+        var AtomicInteger = createObject( "java", "java.util.concurrent.atomic.AtomicInteger" );
+        var rec = {
+            id = arguments.id,
+            status = "running",
+            method = meta.method ?: "upload",
+            transferType = "upload",
+            totalChunks = meta.totalChunks ?: 0,
+            completedChunks = meta.completedChunks ?: 0,
+            activeThreads = AtomicInteger.init( 0 ),
+            filename = meta.filename ?: "",
+            startedAt = now(),
+            startedTick = getTickCount()
+        };
+        variables.activeUploads.put( arguments.id, rec );
+    }
+	/**
+	 * Increment the count of completed chunks for a given transfer ID. This can be used to track progress of multipart uploads/downloads.
+	 * @id the unique identifier for the transfer (upload or download)
+	 * @n the number of chunks to increment (default is 1)
+	 */
+    public void function incCompletedChunk( required string id, numeric n = 1 ){
+        var rec = variables.activeDownloads.get( arguments.id );
+        if( isNull( rec ) ) rec = variables.activeUploads.get( arguments.id );
+        if( isNull( rec ) ) return;
+        try { rec.completedChunks = ( rec.completedChunks ?: 0 ) + arguments.n; } catch( any ignore ){}
+    }
+	/**
+	 * Set the count of completed chunks for a given transfer ID. This can be used to update progress of multipart uploads/downloads to a specific value.
+	 * @id the unique identifier for the transfer (upload or download)
+	 * @count the total number of completed chunks to set
+	 */
+    public void function setCompletedChunks( required string id, required numeric count ){
+        var rec = variables.activeDownloads.get( arguments.id );
+        if( isNull( rec ) ) rec = variables.activeUploads.get( arguments.id );
+        if( isNull( rec ) ) return;
+        rec.completedChunks = arguments.count;
+    }
+	/**
+	 * Update the metadata for a given transfer ID. This can be used to update progress, status, or other info about the transfer. The meta struct can include any keys, but "activeThreads" is reserved for tracking the number of active threads associated with this transfer and will be excluded from direct updates to prevent conflicts with the incActiveThread and decActiveThread methods.
+	 * @id the unique identifier for the transfer (upload or download)
+	 * @meta a struct containing any metadata to update for this transfer (e.g. status, method, totalChunks, filename, etc.). The "activeThreads" key is reserved and will not be directly updated via this method to avoid conflicts with the thread counting methods.
+	 */
+    public void function updateMeta( required string id, struct meta ){
+        var rec = variables.activeDownloads.get( arguments.id );
+        if( isNull( rec ) ) rec = variables.activeUploads.get( arguments.id );
+        if( isNull( rec ) ) return;
+        for( var k in arguments.meta ){
+            if( k != "activeThreads" ) rec[ k ] = arguments.meta[ k ];
+        }
+    }
+	/**
+	 * Mark a transfer (upload or download) as finished, with an optional success flag. This will update the status of the transfer to "completed" or "failed" based on the success parameter, and will remove it from the active transfers map. It will also adjust the global active thread count by subtracting the active threads associated with this transfer to ensure accurate monitoring.
+	 * @id the unique identifier for the transfer (upload or download) to mark as finished
+	 * @success a boolean flag indicating whether the transfer completed successfully (true) or failed (false). This will set the status of the transfer to "completed" if true, or "failed" if false.
+	 */
+    public void function finishDownload( required string id, boolean success = true ){
+        var rec = variables.activeDownloads.get( arguments.id );
+        if( !isNull( rec ) ){
+            // Adjust global thread count defensively
+            try { variables.totalActiveThreads.addAndGet( - rec.activeThreads.get() ); } catch( any ignore ){}
+            rec.status = success ? "completed" : "failed";
+            if( success ) rec.completedChunks = rec.totalChunks;
+            variables.activeDownloads.remove( arguments.id );
+        }
+    }
+	/**
+	 * Mark a transfer (upload or download) as finished, with an optional success flag. This will update the status of the transfer to "completed" or "failed" based on the success parameter, and will remove it from the active transfers map. It will also adjust the global active thread count by subtracting the active threads associated with this transfer to ensure accurate monitoring.
+	 * @id the unique identifier for the transfer (upload or download) to mark as finished
+	 * @success a boolean flag indicating whether the transfer completed successfully (true) or failed (false). This will set the status of the transfer to "completed" if true, or "failed" if false.
+	 */
+    public void function finishUpload( required string id, boolean success = true ){
+        var rec = variables.activeUploads.get( arguments.id );
+        if( !isNull( rec ) ){
+            try { variables.totalActiveThreads.addAndGet( - rec.activeThreads.get() ); } catch( any ignore ){}
+            rec.status = success ? "completed" : "failed";
+            if( success ) rec.completedChunks = rec.totalChunks;
+            variables.activeUploads.remove( arguments.id );
+        }
+    }
+	/**
+	 * Increment the count of active threads for a given transfer ID. This should be called when a thread starts working on a chunk of the transfer to keep track of how many threads are actively processing this transfer. The monitor uses this information to provide insights into how many threads are currently active across all transfers, and to help identify potential bottlenecks or issues in the transfer process.
+	 * @id the unique identifier for the transfer (upload or download) for which to increment the active thread count
+	 */
+    public void function incActiveThread( required string id ){
+        var rec = variables.activeDownloads.get( arguments.id );
+        if( isNull( rec ) ) rec = variables.activeUploads.get( arguments.id );
+        if( isNull( rec ) ) return;
+        rec.activeThreads.incrementAndGet();
+        variables.totalActiveThreads.incrementAndGet();
+    }
+	/**
+	 * Decrement the count of active threads for a given transfer ID. This should be called when a thread finishes working on a chunk of the transfer to keep track of how many threads are actively processing this transfer. The monitor uses this information to provide insights into how many threads are currently active across all transfers, and to help identify potential bottlenecks or issues in the transfer process. The method ensures that the active thread count does not go negative, and will adjust the global active thread count accordingly.
+	 * @id the unique identifier for the transfer (upload or download) for which to decrement the active thread count
+	 */
+    public void function decActiveThread( required string id ){
+        var rec = variables.activeDownloads.get( arguments.id );
+        if( isNull( rec ) ) rec = variables.activeUploads.get( arguments.id );
+        if( isNull( rec ) ) return;
+        // Ensure non-negative
+        try { rec.activeThreads.decrementAndGet(); } catch( any ignore ){}
+        try { variables.totalActiveThreads.decrementAndGet(); } catch( any ignore ){}
+    }
+    /**
+     * Return an array of small JSON-able structs with safe metrics.
+     * @details when true, include sanitized per-transfer info (no bucket or full paths).
+     */
+    public array function snapshot( boolean details = false ){
+        var downloadsInProgress = variables.activeDownloads.size();
+        var uploadsInProgress   = variables.activeUploads.size();
+        var activeThreadsCount  = variables.totalActiveThreads.get();
+        var out = [
+            { metric: "downloadsInProgress", count: downloadsInProgress },
+            { metric: "uploadsInProgress", count: uploadsInProgress },
+            { metric: "activeThreads", count: activeThreadsCount }
+        ];
+		// Optionally include details of active transfers, sanitized to exclude sensitive info like bucket names or full paths, but include filename and progress metrics
+        if( arguments.details ){
+            var transfers = [];
+            // Collect downloads
+            var it = variables.activeDownloads.keySet().iterator();
+            while( it.hasNext() ){
+                var key = it.next();
+                var rec = variables.activeDownloads.get( key );
+                var startedAt = rec.startedAt;
+                var elapsedMS = 0;
+                try { elapsedMS = getTickCount() - ( rec.startedTick ?: getTickCount() ); } catch( any ignore ){}
+                transfers.append({
+                    id: rec.id ?: key,
+                    status: rec.status,
+                    method: rec.method,
+                    transferType: rec.transferType ?: "download",
+                    totalChunks: rec.totalChunks,
+                    completedChunks: rec.completedChunks ?: 0,
+                    activeThreads: rec.activeThreads.get(),
+                    filename: listLast( rec.filename ?: "", "/" ),
+                    startedAt: startedAt,
+                    elapsedMS: elapsedMS
+                });
+            }
+            // Collect uploads
+            it = variables.activeUploads.keySet().iterator();
+            while( it.hasNext() ){
+                var key = it.next();
+                var rec = variables.activeUploads.get( key );
+                var startedAt = rec.startedAt;
+                var elapsedMS = 0;
+                try { elapsedMS = getTickCount() - ( rec.startedTick ?: getTickCount() ); } catch( any ignore ){}
+                transfers.append({
+                    id: rec.id ?: key,
+                    status: rec.status,
+                    method: rec.method,
+                    transferType: rec.transferType ?: "upload",
+                    totalChunks: rec.totalChunks,
+                    completedChunks: rec.completedChunks ?: 0,
+                    activeThreads: rec.activeThreads.get(),
+                    filename: listLast( rec.filename ?: "", "/" ),
+                    startedAt: startedAt,
+                    elapsedMS: elapsedMS
+                });
+            }
+            out.append({ metric: "transfers", value: transfers });
+        }
+        return out;
+    }
+}

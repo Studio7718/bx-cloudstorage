@@ -1,7 +1,7 @@
 /**
  * S3JavaSDKStrategy - Implements ICloudStorageStrategy using AWS SDK for Java v2 with dynamic class loading
  */
-class implements="bxModules.bxcloudstorage.models.vendor.ICloudStorageStrategy" {
+class implements="bxModules.bxcloudstorage.models.vendor.ICloudStorageStrategy" threadSafe {
 	property s3Client;
 	property s3AsyncClient;
 	property credentialsProvider;
@@ -540,6 +540,26 @@ class implements="bxModules.bxcloudstorage.models.vendor.ICloudStorageStrategy" 
 	}
 
 	/**
+	 * Get an object as a streaming ResponseInputStream (caller must close).
+	 * @bucketName S3 bucket
+	 * @objectKey S3 key
+	 * @return ResponseInputStream that the caller must close
+	 */
+	public any function getObjectStream( required string bucketName, required string objectKey ){
+		try {
+			var GetObjectRequest = createObject( "java", "software.amazon.awssdk.services.s3.model.GetObjectRequest" );
+			var getRequest = GetObjectRequest.builder()
+				.bucket( arguments.bucketName )
+				.key( arguments.objectKey )
+				.build();
+			var response = variables.s3Client.getObject( getRequest );
+			return response;
+		} catch( any e ){
+			throw( message = "S3JavaSDKStrategy.getObjectStream failed: " & e.message );
+		}
+	}
+
+	/**
 	 * Get object metadata from S3 using AWS SDK for Java v2
 	 * @bucketName S3 bucket
 	 * @objectKey S3 key
@@ -565,6 +585,16 @@ class implements="bxModules.bxcloudstorage.models.vendor.ICloudStorageStrategy" 
 				lastModifiedStr = lastModified.toString();
 			}
 
+			// Optional checksum fields (present if uploaded with checksum support)
+			var cCRC32   = "";
+			var cCRC32C  = "";
+			var cSHA1    = "";
+			var cSHA256  = "";
+			try { cCRC32  = response.checksumCRC32() ?: ""; } catch( any ignore ){}
+			try { cCRC32C = response.checksumCRC32C() ?: ""; } catch( any ignore ){}
+			try { cSHA1   = response.checksumSHA1() ?: ""; } catch( any ignore ){}
+			try { cSHA256 = response.checksumSHA256() ?: ""; } catch( any ignore ){}
+
 			return {
 				isDirectory = false,
 				success = true,
@@ -575,6 +605,10 @@ class implements="bxModules.bxcloudstorage.models.vendor.ICloudStorageStrategy" 
 				lastModified = lastModifiedStr,
 				eTag = response.eTag() ?: "",
 				versionId = response.versionId() ?: "",
+				checksumCRC32  = cCRC32,
+				checksumCRC32C = cCRC32C,
+				checksumSHA1   = cSHA1,
+				checksumSHA256 = cSHA256
 			};
 		} catch( any e ){
 			// Provide clearer 404 handling and directory prefix metadata when object key is not a real object

@@ -65,18 +65,26 @@ class {
 
         // Use CloudStorageService to get the storage and parse destination object
 		var cloud = new CloudStorageService().getStorageForPath( arguments.destination );
+        // Prepare transfer monitoring
+        var monitor = new CloudStorageService().getTransferMonitor();
+        var uploadId = createObject( "java", "java.util.UUID" ).randomUUID().toString();
 
         // Small file: single putObject via cloud.storage
         if( size <= multipartThreshold ){
+            // Register upload in monitor
+            try { monitor.registerUpload( uploadId, { method: "single-put", totalChunks: 1, filename: arguments.source } ); } catch( any ignore ){}
             try {
                 var contentType = '';
                 try { contentType = fileGetMimeType( arguments.source ); } catch( any ignore ){}
 				writeLog( log="CloudStorage", type="debug", text="CSFileUpload: Performing single PUT for small file upload: " & arguments.source & " to " & arguments.destination );
                 var putResp = cloud.storage.putObject( cloud.bucketName, cloud.objectKey, fileReadBinary( arguments.source ), contentType );
-				writeLog( log="CloudStorage", type="debug", text="CSFileUpload: Single PUT upload completed: " & arguments.source & " to " & arguments.destination );
+				writeLog( log="CloudStorage", type="info", text="CSFileUpload: Single PUT upload completed: " & arguments.source & " to " & arguments.destination );
+                try { monitor.setCompletedChunks( uploadId, 1 ); } catch( any ignore ){}
+                try { monitor.finishUpload( uploadId, true ); } catch( any ignore ){}
                 return { success=true, message='uploaded', bucketName=cloud.bucketName, objectKey=cloud.objectKey, etag=putResp?.eTag ?: '' };
             } catch( any e ) {
 				writeLog( log="CloudStorage", type="error", text="CSFileUpload: Small file upload failed: " & e.message );
+                try { monitor.finishUpload( uploadId, false ); } catch( any ignore ){}
                 return { success=false, message='CSFileUpload small put failed: ' & e.message, bucketName=cloud.bucketName, objectKey=cloud.objectKey };
             }
         }
@@ -84,6 +92,9 @@ class {
         // Large file: multipart async upload via cloud.storage
         try {
 			writeLog( log="CloudStorage", type="debug", text="CSFileUpload: Performing multipart upload for large file: ( " & size & " bytes) " & arguments.source & " to " & arguments.destination );
+            var partsCount = 1;
+            try { partsCount = int( ( size + arguments.partSize - 1 ) / arguments.partSize ); } catch( any ignore ){}
+            try { monitor.registerUpload( uploadId, { method: "multipart", totalChunks: partsCount, filename: arguments.source } ); } catch( any ignore ){}
             var uploadResp = cloud.storage.multipartUploadAsync(
                 cloud.bucketName,
                 cloud.objectKey,
@@ -94,9 +105,12 @@ class {
             );
             if( structKeyExists( uploadResp, "error" ) && uploadResp.error ){
 				writeLog( log="CloudStorage", type="error", text="CSFileUpload: Multipart upload failed: " & uploadResp.message );
+                try { monitor.finishUpload( uploadId, false ); } catch( any ignore ){}
                 return { success=false, message='CSFileUpload multipart failed: ' & uploadResp.message, bucketName=cloud.bucketName, objectKey=cloud.objectKey };
             }
-			writeLog( log="CloudStorage", type="debug", text="CSFileUpload: Multipart upload completed: " & arguments.source & " to " & arguments.destination );
+			writeLog( log="CloudStorage", type="info", text="CSFileUpload: Multipart upload completed: " & arguments.source & " to " & arguments.destination );
+            try { monitor.setCompletedChunks( uploadId, partsCount ); } catch( any ignore ){}
+            try { monitor.finishUpload( uploadId, true ); } catch( any ignore ){}
             return {
                 success=true,
                 message='uploaded (multipart)',
@@ -107,6 +121,7 @@ class {
             };
         } catch( any e ) {
 			writeLog( log="CloudStorage", type="error", text="CSFileUpload: Multipart upload exception: " & e.message );
+            try { monitor.finishUpload( uploadId, false ); } catch( any ignore ){}
             return { success=false, message='CSFileUpload multipart failed: ' & e.message, bucketName=cloud.bucketName, objectKey=cloud.objectKey };
         }
     }

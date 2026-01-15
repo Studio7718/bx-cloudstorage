@@ -1,0 +1,189 @@
+/**
+ * BOXLANG BIF: Compare two files by CRC32.
+ *
+ * Supports local files and cloud storage paths (e.g., s3:///bucket/key).
+ * Uses streaming to compute CRC32 efficiently without loading entire files into memory.
+ */
+import bxModules.bxcloudstorage.models.CloudStorageService;
+
+@BoxBIF
+class {
+
+    /**
+     * Compute CRC32 for two inputs and report equality.
+     *
+     * @fileA First file path (local or cloud, e.g., s3:///bucket/key or relative key).
+     * @fileB Second file path (local or cloud).
+     * @return Struct: { success:boolean, equals:boolean, crcA:numeric, crcB:numeric, sizeA:numeric, sizeB:numeric, message:string }
+     */
+    struct function invoke( required string fileA, required string fileB, string mode = "auto", boolean debug = false ){
+        var cs = new CloudStorageService();
+        var bucketSetting = "";
+        try { bucketSetting = getSystemSetting( "S3_BUCKET", "" ); } catch( any ignore ){}
+
+        try {
+            var A = cs.resolvePath( arguments.fileA, bucketSetting );
+            var B = cs.resolvePath( arguments.fileB, bucketSetting );
+
+            // Optional fast-path using ETag when both are cloud and caller allows it
+            var modeLower = lcase( arguments.mode ?: "auto" );
+            if( ( modeLower == "auto" || modeLower == "etag" ) && A.isCloud && B.isCloud ){
+                try {
+                    var metaA = A.storage.getObjectMetadata( A.bucketName, A.objectKey );
+                    var metaB = B.storage.getObjectMetadata( B.bucketName, B.objectKey );
+                    // Only consider ETag for actual objects (not prefixes/directories)
+                    var isDirA = ( metaA.isDirectory ?: false );
+                    var isDirB = ( metaB.isDirectory ?: false );
+                    if( isDirA || isDirB ){
+                        if( modeLower == "etag" ){
+                            return {
+                                success = false,
+                                equals  = false,
+                                method  = "etag",
+                                message = "ETag mode requires object keys; a directory/prefix was provided"
+                            };
+                        }
+                        // In auto mode, fall through to CRC path which will also error on directories
+                    }
+                    var eA = ( metaA.eTag ?: "" );
+                    var eB = ( metaB.eTag ?: "" );
+                    // Single-part uploads typically have ETag without '-' per AWS docs
+                    var looksSingleA = len( eA ) && find( '-', eA ) == 0;
+                    var looksSingleB = len( eB ) && find( '-', eB ) == 0;
+                    if( looksSingleA && looksSingleB && eA == eB ){
+                        // Sizes should also match for extra safety
+                        var sA = metaA.size ?: 0;
+                        var sB = metaB.size ?: 0;
+                        if( sA == sB ){
+                            return {
+                                success = true,
+                                equals  = true,
+                                crcA    = 0,
+                                crcB    = 0,
+                                sizeA   = sA,
+                                sizeB   = sB,
+                                method  = "etag",
+                                message = "files identical by ETag (single-part)"
+                            };
+                        }
+                    }
+                    // If explicitly mode='etag', do not fall back
+                    if( modeLower == "etag" ){
+                        return {
+                            success = true,
+                            equals  = false,
+                            crcA    = 0,
+                            crcB    = 0,
+                            sizeA   = metaA.size ?: 0,
+                            sizeB   = metaB.size ?: 0,
+                            method  = "etag",
+                            message = "ETag not equal or multipart; no CRC fallback in etag mode"
+                        };
+                    }
+                } catch( any ignore ){}
+            }
+
+            var resA = computeCRC32( A );
+            var resB = computeCRC32( B );
+
+            if( resA.error ) return { success:false, equals:false, message: resA.message ?: "CRC failed for fileA" };
+            if( resB.error ) return { success:false, equals:false, message: resB.message ?: "CRC failed for fileB" };
+
+            var equals = ( resA.crc ?: -1 ) == ( resB.crc ?: -2 ) && ( resA.size ?: -1 ) == ( resB.size ?: -2 );
+            var result = {
+                success = true,
+                equals  = equals,
+                crcA    = resA.crc ?: 0,
+                crcB    = resB.crc ?: 0,
+                sizeA   = resA.size ?: 0,
+                sizeB   = resB.size ?: 0,
+                method  = "crc32",
+                message = equals ? "files identical by CRC32" : "files differ by CRC32 or size"
+            };
+            if( arguments.debug ){
+                result.source = A;
+                result.target = B;
+            }
+            return result;
+        } catch( any e ){
+            return { success:false, equals:false, message: "CSFileCRCCompare failed: " & ( e.message ?: "" ) };
+        }
+    }
+
+    /**
+     * Compute CRC32 for a resolved path descriptor from CloudStorageService.resolvePath.
+     * Returns { error:boolean, message:string, crc:numeric, size:numeric }.
+     */
+    private struct function computeCRC32( required struct desc ){
+        try {
+            var CRC32 = createObject( "java", "java.util.zip.CRC32" );
+            var crc = CRC32.init();
+            var total = 0;
+
+            // Reusable buffer
+            var ByteBuffer = createObject( "java", "java.nio.ByteBuffer" );
+            var buf = ByteBuffer.allocate( 64 * 1024 ).array();
+
+            if( desc.isCloud ){
+                // Prefer provider-stored checksums via metadata to avoid content transfer.
+                var meta = desc.storage.getObjectMetadata( desc.bucketName, desc.objectKey );
+                // Reject prefixes/directories explicitly for CRC comparisons
+                if( ( meta.isDirectory ?: false ) ){
+                    return { error:true, message: "CRC requires an object key; received a directory/prefix", size: 0 };
+                }
+                // If object is not found, surface a clear error
+                if( ( meta.notFound ?: false ) ){
+                    return { error:true, message: "Cloud object not found for CRC: " & ( desc.objectKey ?: "" ), size: 0 };
+                }
+                // checksumCRC32 may be base64-encoded per AWS docs; decode to numeric if present.
+                if( structKeyExists( meta, "checksumCRC32" ) && len( meta.checksumCRC32 ) ){
+                    // AWS returns base64 of raw CRC32 bytes; convert to numeric by decoding then interpreting 4-byte big-endian
+                    var b = toBinary( meta.checksumCRC32 );
+                    var ByteBuffer = createObject( "java", "java.nio.ByteBuffer" );
+                    var bb = ByteBuffer.wrap( b );
+                    // Ensure big-endian
+                    bb.order( createObject( "java", "java.nio.ByteOrder" ).BIG_ENDIAN );
+                    var val = bb.getInt();
+                    // Convert signed int to unsigned 32-bit numeric without hex literals
+                    var unsigned = val;
+                    if( val < 0 ) unsigned = val + 4294967296; // 2^32
+                    return { error:false, crc: unsigned, size: ( meta.size ?: 0 ) };
+                }
+
+                // Fallback: stream from cloud to compute CRC when metadata checksum is unavailable.
+                var in = desc.storage.getObjectStream( desc.bucketName, desc.objectKey );
+                try {
+                    while( true ){
+                        var read = in.read( buf );
+                        if( read == -1 ) break;
+                        crc.update( buf, 0, read );
+                        total += read;
+                    }
+                } finally {
+                    try { in.close(); } catch( any ignore ){}
+                }
+                return { error:false, crc: crc.getValue(), size: total };
+            } else {
+                // Local filesystem path
+                if( !fileExists( desc.localPath ) ){
+                    return { error:true, message: "Local file not found: " & ( desc.localPath ?: "" ) };
+                }
+                var FileInputStream = createObject( "java", "java.io.FileInputStream" );
+                var fin = FileInputStream.init( desc.localPath );
+                try {
+                    while( true ){
+                        var read = fin.read( buf );
+                        if( read == -1 ) break;
+                        crc.update( buf, 0, read );
+                        total += read;
+                    }
+                } finally {
+                    try { fin.close(); } catch( any ignore ){}
+                }
+                return { error:false, crc: crc.getValue(), size: total };
+            }
+        } catch( any e ){
+            return { error:true, message: e.message ?: "computeCRC32 error" };
+        }
+    }
+}

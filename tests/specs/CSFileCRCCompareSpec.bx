@@ -1,0 +1,49 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/" {
+
+    function beforeAll(){
+        super.beforeAll();
+        variables.testLocalPath = getSystemSetting( "S3_TEST_LOCAL_PATH", "/tmp/s3test/" );
+        if( !directoryExists( variables.testLocalPath ) ) directoryCreate( variables.testLocalPath, true );
+        variables.fileA = variables.testLocalPath & "crc-a-" & lcase( replace( createUUID(), '-', '', 'all' ) ) & ".bin";
+        variables.fileB = variables.testLocalPath & "crc-b-" & lcase( replace( createUUID(), '-', '', 'all' ) ) & ".bin";
+    }
+
+    function afterAll(){
+        try { if( fileExists( variables.fileA ) ) fileDelete( variables.fileA ); } catch( any ignore ){}
+        try { if( fileExists( variables.fileB ) ) fileDelete( variables.fileB ); } catch( any ignore ){}
+    }
+
+    function run(){
+        describe( 'CSFileCRCCompare (local files)', () => {
+            it( 'returns equals=true for identical content', () => {
+                // Write identical content to both files
+                var chunk = repeatString( "z", 4096 );
+                var outA = createObject( 'java', 'java.io.FileOutputStream' ).init( variables.fileA );
+                var outB = createObject( 'java', 'java.io.FileOutputStream' ).init( variables.fileB );
+                try {
+                    for( var i = 1; i <= 64; i++ ){
+                        var bytes = toBinary( toBase64( chunk ) );
+                        outA.write( bytes );
+                        outB.write( bytes );
+                    }
+                } finally {
+                    outA.close(); outB.close();
+                }
+
+                var res = CSFileCRCCompare( fileA = variables.fileA, fileB = variables.fileB );
+                expect( res.success ).toBeTrue();
+                expect( res.equals ).toBeTrue();
+                expect( res.crcA ).toBe( res.crcB );
+                expect( res.sizeA ).toBe( res.sizeB );
+            });
+
+            it( 'returns equals=false when content differs', () => {
+                // Modify fileB
+                fileAppend( variables.fileB, "different" );
+                var res = CSFileCRCCompare( fileA = variables.fileA, fileB = variables.fileB );
+                expect( res.success ).toBeTrue();
+                expect( res.equals ).toBeFalse();
+            });
+        });
+    }
+}

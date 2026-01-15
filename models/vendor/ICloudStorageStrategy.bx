@@ -59,6 +59,14 @@ interface ICloudStorageStrategy {
         required numeric startByte,
         required numeric endByte
     );
+
+	/**
+	 * Stream an object without loading into memory (caller must close stream).
+	 * @bucketName string
+	 * @objectKey string
+	 * @return any (ResponseInputStream)
+	 */
+	public any function getObjectStream( required string bucketName, required string objectKey );
 	/**
 	 * List objects (V2)
 	 * @bucketName string

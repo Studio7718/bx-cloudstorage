@@ -1,6 +1,7 @@
 import bxModules.bxcloudstorage.models.vendor.aws.*;
+import bxModules.bxcloudstorage.models.TransferMonitor;
 
-class singleton {
+class threadSafe singleton {
 	/*
 	CloudStorageService: S3 functionality for (BIFs)
 
@@ -124,6 +125,8 @@ class singleton {
 	public boolean function isLocalPath( required string path ){
 		var p = arguments.path ?: "";
 		if( !len( p ) ) return false;
+		// Treat file:// URIs as local paths
+		if( reFindNoCase( "^file://", p ) ) return true;
 		if( left( p, 1 ) == "/" ) return true;
 		if( reFindNoCase( "^[A-Z]:[\\/]", p ) ) return true;
 		try { if( fileExists( p ) || directoryExists( p ) ) return true; } catch( any ignore ){}
@@ -149,6 +152,19 @@ class singleton {
 			prefix = "/",
 			localPath = arguments.path
 		};
+		// Normalize file:// URIs to local filesystem paths and return early
+		if( reFindNoCase( "^file://", arguments.path ) ){
+			var loc = arguments.path;
+			if( left( loc, 7 ) == "file://" ){
+				loc = mid( loc, 8, len( loc ) );
+			} else {
+				loc = replace( loc, "file://", "", "one" );
+			}
+			// Basic decode for spaces; avoid over-assuming full URL decoding
+			loc = replace( loc, "%20", " ", "all" );
+			descriptor.localPath = loc;
+			return descriptor;
+		}
 		if( isCloudPath( arguments.path ) ){
 			var cloud = getStorageForPath( path=arguments.path, storage=arguments.storage ?: getCloudStorage( vendor="aws-s3" ) );
 			descriptor.isCloud    = true;
@@ -171,7 +187,21 @@ class singleton {
 		}
 		return descriptor;
 	}
-
+	/**
+	 * Get or create the singleton TransferMonitor instance stored in application scope.
+	 * Uses an application-level lock to ensure thread safety during initialization.
+	 * The monitor tracks active transfers and their metrics for reporting via BIFs.
+	 *
+	 * @return TransferMonitor instance
+	 */
+	public function getTransferMonitor(){
+		lock scope="application" type="exclusive" timeout=5000 {
+			if( !structKeyExists( application, "bxcloudstorage" ) || !structKeyExists( application.bxcloudstorage, "monitor" ) ){
+				application.bxcloudstorage.monitor = new TransferMonitor();
+			}
+			return application.bxcloudstorage.monitor;
+		}
+	}
 	/**
 	 * Parse a path and optional s3Bucket setting into a normalized
 	 * bucketName + objectKey pair.
@@ -183,7 +213,8 @@ class singleton {
 	 *  - Validates maximum lengths defensively; throws on invalid scenarios.
 	 *
 	 * @path string  Either full s3:///bucket/key or relative key
-	 * @s3Bucket  string  Optional configured bucket (can include prefix e.g. mybucket/path/root)
+	 * @bucket  string  Optional configured bucket (can include prefix e.g. mybucket/path/root)
+	 * @storage ICloudStorageStrategy Optional storage strategy for bucket validation; if not provided, will attempt to resolve default AWS S3 strategy
 	 * @return { bucketName:string, objectKey:string }
 	 */
 	public struct function getStorageForPath( required string path, string bucket = "", ICloudStorageStrategy storage ){

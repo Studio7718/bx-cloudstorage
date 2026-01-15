@@ -32,6 +32,8 @@ Built for BoxLang (minimum version 1.7.0) and designed to plug into ColdBox / Bo
 | `CSFileGet` | Read object bytes (returns binary) |
 | `CSFileInfo` | Get object metadata (size, contentType, eTag, etc.) or directory prefix aggregate (objectCount, totalSize, latest modified). |
 | `CSFilePresign` | Generate presigned URL (GET/PUT) with optional headers |
+| `CSFileCRCCompare` | Compare two files (local or S3) by CRC checksum. |
+| `CSFileTransferStatus` | Get current transfer status metrics (active transfers, counts, etc.) from the monitor. |
 | `CSDirectoryCreate` | Create (ensure) S3 "directory" placeholder. |
 | `CSDirectoryExists` | Boolean existence check for prefix placeholder / any object under prefix. |
 | `CSDirectoryList` | List objects under a prefix with filters & formats. |
@@ -160,6 +162,20 @@ var presignedGet = CSFilePresign( file='s3:///exports/report.csv', method='GET',
 var presignedPut = CSFilePresign( file='s3:///uploads/new.csv', method='PUT', contentType='text/csv', metadata={ source='app' } );
 ```
 
+### CRC Compare
+```boxlang
+var compare = CSFileCRCCompare( fileA='s3:///exports/report.csv', fileB='/tmp/report.csv' );
+if( compare.error ) writeOutput( 'Comparison failed: ' & compare.message );
+else if( compare.match ) writeOutput( 'Files match by CRC.' );
+else writeOutput( 'Files do NOT match by CRC.' );
+```
+
+### Transfer Status
+```boxlang
+var status = CSFileTransferStatus( details=true );
+writeDump( status );
+```
+
 ## Testing
 Specs are provided under `tests/specs/` using TestBox BDD patterns. Many specs are env‑driven integration tests.
 
@@ -207,8 +223,8 @@ Each BIF returns a struct or boolean:
 - Batch concurrency should be tuned to instance capacity (default 5).
 
 ## Roadmap / Ideas
-- Optional progress callback hooks for async and batch operations.
-- Integrate checksum / integrity validation post transfer and BIF.
+- Add file and directory move BIFs.
+- Integrate checksum / integrity validation post transfer.
 - Additional cloud storage providers.
 
 ## Contributing
