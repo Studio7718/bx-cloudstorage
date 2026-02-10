@@ -595,16 +595,78 @@ class implements="bxModules.bxcloudstorage.models.vendor.ICloudStorageStrategy" 
 			try { cSHA1   = response.checksumSHA1() ?: ""; } catch( any ignore ){}
 			try { cSHA256 = response.checksumSHA256() ?: ""; } catch( any ignore ){}
 
+			// Parse lastModified to DateTime for consistency with fileInfo/getFileInfo
+			var dateLastModified = "";
+			var fileCreated = "";
+			if( len( lastModifiedStr ) ){
+				try {
+					dateLastModified = parseDateTime( lastModifiedStr );
+					// S3 doesn't track creation separately, use last modified
+					fileCreated = dateLastModified;
+				} catch( any ignore ){}
+			}
+
+			// Extract file name from object key
+			var fileName = listLast( arguments.objectKey, "/" );
+
+			// Determine parent path (bucket + path without filename)
+			var parentPath = "s3:///" & arguments.bucketName;
+			if( arguments.objectKey contains "/" ){
+				var pathParts = listToArray( arguments.objectKey, "/" );
+				if( arrayLen( pathParts ) > 1 ){
+					arrayDeleteAt( pathParts, arrayLen( pathParts ) );
+					parentPath &= "/" & arrayToList( pathParts, "/" );
+				}
+			}
+
+			// Full path
+			var fullPath = "s3:///" & arguments.bucketName & "/" & arguments.objectKey;
+
+			// Build comprehensive response matching fileInfo() structure
 			return {
-				isDirectory = false,
+				// Success indicators
 				success = true,
-				bucketName = arguments.bucketName,
-				prefix = arguments.objectKey,
+				isDirectory = false,
+
+				// Core file properties
+				name = fileName,
+				path = fullPath,
+				parent = parentPath,
 				size = response.contentLength() ?: 0,
+				type = "file",
+
+				// Date/time properties
+				lastmodified = dateLastModified,
+				dateLastModified = dateLastModified,
+				fileCreated = fileCreated,
+
+				// Permission-like properties (S3 objects are read/write via API)
+				canRead = true,
+				canWrite = true,
+				read = true,
+				write = true,
+				execute = false,
+
+				// File system characteristics (S3-specific defaults)
+				scheme = "s3",
+				isHidden = false,
+				isSystem = false,
+				isArchive = false,
+				isCaseSensitive = true,
+				isModeSupported = false,
+				isAttributesSupported = false,
+				mode = "",
+				attributes = "",
+
+				// S3-specific metadata
+				bucketName = arguments.bucketName,
+				objectKey = arguments.objectKey,
 				contentType = response.contentType() ?: "",
-				lastModified = lastModifiedStr,
 				eTag = response.eTag() ?: "",
 				versionId = response.versionId() ?: "",
+
+				// Checksums (use best available as primary checksum)
+				checksum = len( cSHA256 ) ? cSHA256 : ( len( cSHA1 ) ? cSHA1 : ( len( cCRC32C ) ? cCRC32C : cCRC32 ) ),
 				checksumCRC32  = cCRC32,
 				checksumCRC32C = cCRC32C,
 				checksumSHA1   = cSHA1,
@@ -668,15 +730,89 @@ class implements="bxModules.bxcloudstorage.models.vendor.ICloudStorageStrategy" 
 
 					if( objectCount > 0 ){
 						var latestStr = "";
-						try { if( !isNull( latestInstant ) ) latestStr = latestInstant.toString(); } catch( any ignore ){}
+						var latestDate = "";
+						try {
+							if( !isNull( latestInstant ) ){
+								latestStr = latestInstant.toString();
+								try {
+									latestDate = parseDateTime( latestStr );
+								} catch( any ignore ){}
+							}
+						} catch( any ignore ){}
+
+						// Extract directory name from prefix
+						var dirName = prefixKey;
+						if( right( dirName, 1 ) == "/" ){
+							dirName = left( dirName, len( dirName ) - 1 );
+						}
+						dirName = listLast( dirName, "/" );
+						if( !len( dirName ) ) dirName = arguments.bucketName;
+
+						// Determine parent path
+						var parentPath = "s3:///" & arguments.bucketName;
+						if( prefixKey contains "/" ){
+							var pathParts = listToArray( replace( prefixKey, "/", "/", "all" ), "/" );
+							if( arrayLen( pathParts ) > 1 ){
+								arrayDeleteAt( pathParts, arrayLen( pathParts ) );
+								if( arrayLen( pathParts ) > 0 ){
+									parentPath &= "/" & arrayToList( pathParts, "/" );
+								}
+							}
+						}
+
+						// Full path
+						var fullPath = "s3:///" & arguments.bucketName & "/" & prefixKey;
+
 						return {
+							// Success indicators
 							success       : true,
 							isDirectory   : true,
+
+							// Core directory properties
+							name          : dirName,
+							path          : fullPath,
+							parent        : parentPath,
+							size          : totalSize,
+							type          : "directory",
+
+							// Date/time properties
+							lastmodified  : latestDate,
+							dateLastModified : latestDate,
+							fileCreated   : latestDate,
+
+							// Permission-like properties
+							canRead       : true,
+							canWrite      : true,
+							read          : true,
+							write         : true,
+							execute       : false,
+
+							// File system characteristics
+							scheme        : "s3",
+							isHidden      : false,
+							isSystem      : false,
+							isArchive     : false,
+							isCaseSensitive : true,
+							isModeSupported : false,
+							isAttributesSupported : false,
+							mode          : "",
+							attributes    : "",
+
+							// S3-specific metadata
 							bucketName    : arguments.bucketName,
 							prefix        : prefixKey,
+							objectKey     : prefixKey,
 							objectCount   : objectCount,
 							totalSize     : totalSize,
-							lastModifiedLatest : latestStr
+							lastModifiedLatest : latestStr,
+							contentType   : "",
+							eTag          : "",
+							versionId     : "",
+							checksum      : "",
+							checksumCRC32  : "",
+							checksumCRC32C : "",
+							checksumSHA1   : "",
+							checksumSHA256 : ""
 						};
 					}
 					// No objects under prefix; return not-found semantics
@@ -686,7 +822,12 @@ class implements="bxModules.bxcloudstorage.models.vendor.ICloudStorageStrategy" 
 						statusCode : 404,
 						message    : "Object or prefix not found",
 						bucketName : arguments.bucketName,
-						objectKey  : arguments.objectKey
+						objectKey  : arguments.objectKey,
+						name       : "",
+						path       : "s3:///" & arguments.bucketName & "/" & arguments.objectKey,
+						size       : 0,
+						type       : "",
+						isDirectory: false
 					};
 				} catch( any le ){
 					// If listing fails, propagate original error text

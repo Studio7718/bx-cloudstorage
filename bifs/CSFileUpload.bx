@@ -25,32 +25,51 @@ class {
     property name="moduleRecord";
 
     /**
-     * Upload a local file to S3, choosing single PUT or multipart upload based on size.
-     * Streams from disk for low memory usage.
+     * Upload a local file or binary data to S3, choosing single PUT or multipart upload based on size.
+     * Streams from disk for low memory usage when using file path.
      *
-     * @source Absolute path to the local file to upload.
+     * @source Either an absolute path to the local file to upload (string), or a binary object to upload directly.
      * @destination Cloud destination: `s3:///bucket/key` or relative key (resolved via settings in CloudStorageService).
      * @multipartThreshold File size in bytes above which multipart upload is used (default 25MB; overridable via `UploadMultipartThreshold`).
      * @partSize Size in bytes for each multipart part (default 16MB; minimum 5MB per S3 rules; overridable via `UploadPartSize`).
      * @maxConcurrent Maximum concurrent part uploads for multipart mode (default from code 54; overridable via `UploadMaxConcurrent`).
      * @fileTimeout Timeout in seconds for the overall upload in multipart mode (default 60; overridable via `FileTransferTimeout`).
+     * @contentType Optional MIME type for binary uploads. For file path uploads, auto-detected if not specified.
      * @return Struct: `{ success:boolean, message:string, bucketName:string, objectKey:string, etag?:string, parts?:numeric }`. On failure, `success=false` with `message`.
      */
     struct function invoke(
-        required string source,
+        required any source,
         required string destination,
         numeric multipartThreshold = 25 * 1024 * 1024,
         numeric partSize = 16 * 1024 * 1024,
         numeric maxConcurrent = 54,
-        numeric fileTimeout = 60
+        numeric fileTimeout = 60,
+        string contentType = ""
     ) {
-        // Validate file
-        if( !fileExists( arguments.source ) ){
-            return { success=false, message='CSFileUpload: Local file not found', bucketName='', objectKey='' };
+        // Determine if source is binary or file path
+        var isBinarySource = isBinary( arguments.source );
+        var sourceFilePath = "";
+        var binaryData = "";
+        var size = 0;
+        var sourceName = "";
+
+        if( isBinarySource ){
+            // Source is binary data
+            binaryData = arguments.source;
+            size = arrayLen( binaryData );
+            sourceName = "binary-upload";
+        } else {
+            // Source is file path
+            sourceFilePath = arguments.source;
+            if( !fileExists( sourceFilePath ) ){
+                return { success=false, message='CSFileUpload: Local file not found', bucketName='', objectKey='' };
+            }
+            size = fileInfo( sourceFilePath ).size;
+            sourceName = sourceFilePath;
         }
-        var size = fileInfo( arguments.source ).size;
+
         if( size == 0 ){
-            // Edge case: empty file still valid; treat as small
+            // Edge case: empty file/binary still valid; treat as small
         }
 
         // Override thresholds from module settings if present
@@ -72,13 +91,19 @@ class {
         // Small file: single putObject via cloud.storage
         if( size <= multipartThreshold ){
             // Register upload in monitor
-            try { monitor.registerUpload( uploadId, { method: "single-put", totalChunks: 1, filename: arguments.source } ); } catch( any ignore ){}
+            try { monitor.registerUpload( uploadId, { method: "single-put", totalChunks: 1, filename: sourceName } ); } catch( any ignore ){}
             try {
-                var contentType = '';
-                try { contentType = fileGetMimeType( arguments.source ); } catch( any ignore ){}
-				writeLog( log="CloudStorage", type="debug", text="CSFileUpload: Performing single PUT for small file upload: " & arguments.source & " to " & arguments.destination );
-                var putResp = cloud.storage.putObject( cloud.bucketName, cloud.objectKey, fileReadBinary( arguments.source ), contentType );
-				writeLog( log="CloudStorage", type="info", text="CSFileUpload: Single PUT upload completed: " & arguments.source & " to " & arguments.destination );
+                var mimeType = arguments.contentType;
+                if( !len( mimeType ) && !isBinarySource ){
+                    try { mimeType = fileGetMimeType( sourceFilePath ); } catch( any ignore ){}
+                }
+
+                // Get binary data
+                var uploadData = isBinarySource ? binaryData : fileReadBinary( sourceFilePath );
+
+				writeLog( log="CloudStorage", type="debug", text="CSFileUpload: Performing single PUT for small " & ( isBinarySource ? "binary" : "file" ) & " upload: " & sourceName & " to " & arguments.destination );
+                var putResp = cloud.storage.putObject( cloud.bucketName, cloud.objectKey, uploadData, mimeType );
+				writeLog( log="CloudStorage", type="info", text="CSFileUpload: Single PUT upload completed: " & sourceName & " to " & arguments.destination );
                 try { monitor.setCompletedChunks( uploadId, 1 ); } catch( any ignore ){}
                 try { monitor.finishUpload( uploadId, true ); } catch( any ignore ){}
                 return { success=true, message='uploaded', bucketName=cloud.bucketName, objectKey=cloud.objectKey, etag=putResp?.eTag ?: '' };
@@ -88,29 +113,45 @@ class {
                 return { success=false, message='CSFileUpload small put failed: ' & e.message, bucketName=cloud.bucketName, objectKey=cloud.objectKey };
             }
         }
-
-        // Large file: multipart async upload via cloud.storage
+        // Note: Multipart upload from binary data requires file path; write temp file if binary source
         try {
-			writeLog( log="CloudStorage", type="debug", text="CSFileUpload: Performing multipart upload for large file: ( " & size & " bytes) " & arguments.source & " to " & arguments.destination );
+            if( isBinarySource ){
+                // Binary source: write to temp file for multipart upload
+                sourceFilePath = getTempFile( getTempDirectory(), "cs-upload-" );
+                fileWrite( sourceFilePath, binaryData );
+            }
+
+			writeLog( log="CloudStorage", type="debug", text="CSFileUpload: Performing multipart upload for large " & ( isBinarySource ? "binary" : "file" ) & ": ( " & size & " bytes) " & sourceName & " to " & arguments.destination );
             var partsCount = 1;
             try { partsCount = int( ( size + arguments.partSize - 1 ) / arguments.partSize ); } catch( any ignore ){}
-            try { monitor.registerUpload( uploadId, { method: "multipart", totalChunks: partsCount, filename: arguments.source } ); } catch( any ignore ){}
+            try { monitor.registerUpload( uploadId, { method: "multipart", totalChunks: partsCount, filename: sourceName } ); } catch( any ignore ){}
             var uploadResp = cloud.storage.multipartUploadAsync(
                 cloud.bucketName,
                 cloud.objectKey,
-                arguments.source,
-                arguments.partSize,
+                sourceFilePath,
+				arguments.partSize,
                 maxConcurrent,
                 fileTimeout
             );
             if( structKeyExists( uploadResp, "error" ) && uploadResp.error ){
 				writeLog( log="CloudStorage", type="error", text="CSFileUpload: Multipart upload failed: " & uploadResp.message );
                 try { monitor.finishUpload( uploadId, false ); } catch( any ignore ){}
+
+                // Clean up temp file if we created one
+                if( isBinarySource && len( sourceFilePath ) && fileExists( sourceFilePath ) ){
+                    try { fileDelete( sourceFilePath ); } catch( any ignore ){}
+                }
                 return { success=false, message='CSFileUpload multipart failed: ' & uploadResp.message, bucketName=cloud.bucketName, objectKey=cloud.objectKey };
             }
-			writeLog( log="CloudStorage", type="info", text="CSFileUpload: Multipart upload completed: " & arguments.source & " to " & arguments.destination );
+			writeLog( log="CloudStorage", type="info", text="CSFileUpload: Multipart upload completed: " & sourceName & " to " & arguments.destination );
             try { monitor.setCompletedChunks( uploadId, partsCount ); } catch( any ignore ){}
             try { monitor.finishUpload( uploadId, true ); } catch( any ignore ){}
+
+            // Clean up temp file if we created one
+            if( isBinarySource && len( sourceFilePath ) && fileExists( sourceFilePath ) ){
+                try { fileDelete( sourceFilePath ); } catch( any ignore ){}
+            }
+
             return {
                 success=true,
                 message='uploaded (multipart)',
@@ -122,6 +163,10 @@ class {
         } catch( any e ) {
 			writeLog( log="CloudStorage", type="error", text="CSFileUpload: Multipart upload exception: " & e.message );
             try { monitor.finishUpload( uploadId, false ); } catch( any ignore ){}
+            // Clean up temp file if we created one
+            if( isBinarySource && len( sourceFilePath ) && fileExists( sourceFilePath ) ){
+                try { fileDelete( sourceFilePath ); } catch( any ignore ){}
+            };
             return { success=false, message='CSFileUpload multipart failed: ' & e.message, bucketName=cloud.bucketName, objectKey=cloud.objectKey };
         }
     }
