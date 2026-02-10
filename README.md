@@ -29,7 +29,7 @@ Built for BoxLang (minimum version 1.7.0) and designed to plug into ColdBox / Bo
 | `CSFileDownloadBatch` | Parallel batch downloads (S3→local). |
 | `CSFileCopy` | Copy local↔S3 or S3→S3 single object. |
 | `CSFileDelete` | Delete single S3 object. |
-| `CSFileGet` | Read object bytes (returns binary) |
+| `CSFileRead` | Read object bytes (returns binary) |
 | `CSFileInfo` | Get object metadata (size, contentType, eTag, etc.) or directory prefix aggregate (objectCount, totalSize, latest modified). |
 | `CSFilePresign` | Generate presigned URL (GET/PUT) with optional headers |
 | `CSFileCRCCompare` | Compare two files (local or S3) by CRC checksum. |
@@ -139,7 +139,7 @@ if( !CSDirectoryExists( 's3:///data/cache' ) ) CSDirectoryCreate( 's3:///data/ca
 
 ### Get Object Bytes and Metadata
 ```boxlang
-var bytes = CSFileGet( 's3:///exports/report.csv' );
+var bytes = CSFileRead( 's3:///exports/report.csv' );
 fileWrite( '/tmp/report.csv', bytes );
 
 var info = CSFileInfo( 's3:///exports/report.csv' );

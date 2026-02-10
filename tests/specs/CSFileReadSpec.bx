@@ -18,14 +18,14 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/" {
         var outLocal = getTempDirectory() & 'fileget-' & rand & '.bin';
         if( fileExists( outLocal ) ) fileDelete( outLocal );
 
-        describe( 'CSFileGet BIF (env-configured)', () => {
+        describe( 'CSFileRead BIF (env-configured)', () => {
             it( 'downloads object bytes that can be written to disk', () => {
                 // Upload a temp file to S3
                 var up = CSFileCopy( source = variables.testLocalFileSmall, destination = s3Key );
                 expect( up.success ?: (! ( up.error ?: false )) ).toBeTrue();
 
                 // Get object data
-                var data = CSFileGet( s3Key );
+                var data = CSFileRead( s3Key );
                 expect( isNull( data ) ).toBeFalse();
 
                 // Write to local file to validate content usability across strategies
@@ -39,7 +39,7 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/" {
             });
 
             it( 'returns null for a missing object', () => {
-                var missing = CSFileGet( s3Key & '.missing' );
+                var missing = CSFileRead( s3Key & '.missing' );
                 expect( isNull( missing ) ).toBeTrue();
             });
         });

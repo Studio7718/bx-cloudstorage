@@ -400,6 +400,7 @@ class {
 		arguments.monitor.finishDownload( arguments.downloadId, true );
 		return {
 			filename = destination,
+			error = false,
 			method = "async-multipart",
 			size = localSize,
 			chunks = totalChunks,
