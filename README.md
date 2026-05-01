@@ -68,12 +68,8 @@ settings = {
 - Batch: Uses async futures with configurable concurrency; `failFast=true` aborts remaining items when a failure is detected.
 
 ## Installation
-Download the module from github and place it in your `boxlang_modules/` directory or other configured BoxLang Module directory, or install via CommandBox once released.
+Download the module from github and place it in your `boxlang_modules/` directory or other configured BoxLang Module directory.
 
-From CommandBox (Pending module release):
-```bash
-box install bx-cloudstorage
-```
 Ensure BoxLang runtime & AWS credentials (via environment or configured SDK) are available. The module selects an S3 strategy under the hood.
 
 Install Required Java packages using Maven (Maven needs to be installed):
